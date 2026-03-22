@@ -1,0 +1,26 @@
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "commonjs",
+    "lib": ["ES2020"],
+    "esModuleInterop": true,
+    "strict": true,
+    "outDir": "dist",
+    "rootDir": ".",
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": [
+    "agents/**/*",
+    "identity/**/*",
+    "storage/**/*",
+    "orchestrator/**/*",
+    "scripts/**/*",
+    "test/**/*"
+  ],
+  "exclude": ["node_modules", "dist", "webapp", "artifacts", "cache"]
+}

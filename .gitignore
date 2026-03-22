@@ -1,0 +1,46 @@
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+webapp/node_modules/
+
+# Build artifacts
+dist/
+artifacts/
+cache/
+typechain-types/
+webapp/dist/
+
+# Hardhat
+deployments/localhost.json
+deployments/hardhat.json
+
+# Data files (may contain private keys or sensitive state)
+data/agent-identities.json
+data/treasury-state.json
+
+# Keep mock/seed data but not real state
+# data/mock-prs.json  <- OK to commit (mock data)
+# data/reputation.json <- OK to commit (seeded demo data)
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+
+# Temp
+tmp/
+*.tmp
