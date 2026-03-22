@@ -84,67 +84,40 @@ async function main(): Promise<void> {
   await writeJson('mock-prs.json', mockPRs);
 
   // ─── reputation.json ──────────────────────────────────────────────────────
+  // Format must match ReputationStore: { contributors: ContributorReputation[], lastUpdated, version }
   const reputation = {
-    'protocol-dev': {
-      githubHandle: 'protocol-dev',
-      score: 847,
-      badges: ['CORE_CONTRIBUTOR', 'INTEROP_HERO'],
-      lastUpdated: new Date().toISOString(),
-    },
-    'mesh-builder': {
-      githubHandle: 'mesh-builder',
-      score: 634,
-      badges: ['SECURITY_EXPERT'],
-      lastUpdated: new Date().toISOString(),
-    },
-    'quic-wizard': {
-      githubHandle: 'quic-wizard',
-      score: 521,
-      badges: ['DOC_MASTER'],
-      lastUpdated: new Date().toISOString(),
-    },
-    'sec-researcher': {
-      githubHandle: 'sec-researcher',
-      score: 712,
-      badges: ['SECURITY_EXPERT', 'FIRST_PR'],
-      lastUpdated: new Date().toISOString(),
-    },
-    'rustacean42': {
-      githubHandle: 'rustacean42',
-      score: 903,
-      badges: ['CORE_CONTRIBUTOR', 'PROTOCOL_DESIGNER'],
-      lastUpdated: new Date().toISOString(),
-    },
-    'cryptobuilder': {
-      githubHandle: 'cryptobuilder',
-      score: 389,
-      badges: ['FIRST_PR'],
-      lastUpdated: new Date().toISOString(),
-    },
-    'go-gopher': {
-      githubHandle: 'go-gopher',
-      score: 156,
-      badges: [],
-      lastUpdated: new Date().toISOString(),
-    },
-    'wasm-wrangler': {
-      githubHandle: 'wasm-wrangler',
-      score: 234,
-      badges: ['FIRST_PR'],
-      lastUpdated: new Date().toISOString(),
-    },
+    contributors: [
+      { address: '0x1111111111111111111111111111111111111111', handle: 'rustacean42', score: 903, badges: ['core-contributor', 'protocol-designer'], badgeDetails: [], prsReviewed: 31, prsApproved: 29, prsRejected: 2, aiSlopFlagged: 1, tasksCompleted: 8, tasksCompletedByDifficulty: { beginner: 2, intermediate: 3, advanced: 2, expert: 1 }, firstContribution: '2024-01-15T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 12, totalEarned: '0', reviewQualityScore: 94 },
+      { address: '0x2222222222222222222222222222222222222222', handle: 'protocol-dev', score: 847, badges: ['core-contributor', 'interop-hero'], badgeDetails: [], prsReviewed: 23, prsApproved: 21, prsRejected: 2, aiSlopFlagged: 0, tasksCompleted: 6, tasksCompletedByDifficulty: { beginner: 1, intermediate: 2, advanced: 2, expert: 1 }, firstContribution: '2024-03-10T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 8, totalEarned: '0', reviewQualityScore: 91 },
+      { address: '0x3333333333333333333333333333333333333333', handle: 'sec-researcher', score: 712, badges: ['security-expert', 'first-pr'], badgeDetails: [], prsReviewed: 18, prsApproved: 16, prsRejected: 2, aiSlopFlagged: 3, tasksCompleted: 4, tasksCompletedByDifficulty: { beginner: 0, intermediate: 1, advanced: 2, expert: 1 }, firstContribution: '2024-05-22T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 6, totalEarned: '0', reviewQualityScore: 88 },
+      { address: '0x4444444444444444444444444444444444444444', handle: 'mesh-builder', score: 634, badges: ['security-expert'], badgeDetails: [], prsReviewed: 17, prsApproved: 15, prsRejected: 2, aiSlopFlagged: 2, tasksCompleted: 5, tasksCompletedByDifficulty: { beginner: 1, intermediate: 2, advanced: 2, expert: 0 }, firstContribution: '2024-06-01T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 5, totalEarned: '0', reviewQualityScore: 85 },
+      { address: '0x5555555555555555555555555555555555555555', handle: 'quic-wizard', score: 521, badges: ['doc-master'], badgeDetails: [], prsReviewed: 14, prsApproved: 13, prsRejected: 1, aiSlopFlagged: 0, tasksCompleted: 3, tasksCompletedByDifficulty: { beginner: 1, intermediate: 2, advanced: 0, expert: 0 }, firstContribution: '2024-07-14T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 4, totalEarned: '0', reviewQualityScore: 82 },
+      { address: '0x6666666666666666666666666666666666666666', handle: 'cryptobuilder', score: 389, badges: ['first-pr'], badgeDetails: [], prsReviewed: 9, prsApproved: 7, prsRejected: 2, aiSlopFlagged: 1, tasksCompleted: 2, tasksCompletedByDifficulty: { beginner: 2, intermediate: 0, advanced: 0, expert: 0 }, firstContribution: '2024-09-03T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 2, totalEarned: '0', reviewQualityScore: 71 },
+      { address: '0x7777777777777777777777777777777777777777', handle: 'wasm-wrangler', score: 234, badges: ['first-pr'], badgeDetails: [], prsReviewed: 5, prsApproved: 4, prsRejected: 1, aiSlopFlagged: 0, tasksCompleted: 1, tasksCompletedByDifficulty: { beginner: 1, intermediate: 0, advanced: 0, expert: 0 }, firstContribution: '2024-11-20T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 1, totalEarned: '0', reviewQualityScore: 65 },
+      { address: '0x8888888888888888888888888888888888888888', handle: 'go-gopher', score: 156, badges: [], badgeDetails: [], prsReviewed: 3, prsApproved: 2, prsRejected: 1, aiSlopFlagged: 0, tasksCompleted: 0, tasksCompletedByDifficulty: { beginner: 0, intermediate: 0, advanced: 0, expert: 0 }, firstContribution: '2025-01-08T00:00:00.000Z', lastActive: new Date().toISOString(), streak: 0, totalEarned: '0', reviewQualityScore: 58 },
+    ],
+    lastUpdated: new Date().toISOString(),
+    version: '1.0',
   };
   await writeJson('reputation.json', reputation);
 
   // ─── treasury-state.json ──────────────────────────────────────────────────
+  // Format must match TreasuryState interface in TreasuryAgent.ts
   const now = Date.now();
   const treasuryState = {
-    balance: '2.5',
-    yieldBalance: '0.15',
-    apy: '5.2',
-    totalRaised: '12.3',
-    monthlyBurnRate: '0.3',
+    address: '0xTreasuryContract000000000000000000000001',
     lastUpdated: new Date().toISOString(),
+    balances: { eth: 2.5, usdc: 500, dai: 250 },
+    yieldPositions: [
+      { protocol: 'Lido stETH', asset: 'ETH', deposited: 1.0, currentValue: 1.05, apy: 4.8, earnedToDate: 0.05, lastCompound: new Date(now - 7 * 86400000).toISOString() },
+      { protocol: 'Ondo OUSG', asset: 'USDC', deposited: 500, currentValue: 512, apy: 5.1, earnedToDate: 12, lastCompound: new Date(now - 3 * 86400000).toISOString() },
+    ],
+    totalValueEth: 2.75,
+    monthlyBurnEth: 0.26,
+    runwayMonths: 10.6,
+    revenueThisMonth: 0.81,
+    costsThisMonth: 0.26,
+    pendingEscrowEth: 0.75,
     spendingHistory: [
       {
         date: new Date(now - 28 * 86400000).toISOString(),
@@ -227,14 +200,19 @@ async function main(): Promise<void> {
   await writeJson('streaming-state.json', streamingState);
 
   // ─── metrics.json ─────────────────────────────────────────────────────────
+  // Format must match MetricsData interface in SupportAgent.ts
   const metrics = {
-    maintainerMinutesSavedThisMonth: 847,
-    maintainerMinutesSavedLastMonth: 623,
-    totalPRsReviewed: 1247,
-    totalBadgesIssued: 89,
-    totalContributors: 23,
-    totalTipped: '12.3',
+    totalQuestionsAnswered: 847,
+    totalMaintainerMinutesSaved: 12705,
+    questionsByCategory: { debugging: 312, 'api-usage': 289, performance: 134, deployment: 78, protocol: 34 },
+    questionsByLanguage: { go: 398, javascript: 301, rust: 148 },
+    averageResponseTimeMs: 340,
     lastUpdated: new Date().toISOString(),
+    runHistory: [
+      { date: new Date(now - 14 * 86400000).toISOString(), questionsAnswered: 12, minutesSaved: 180 },
+      { date: new Date(now - 7 * 86400000).toISOString(), questionsAnswered: 15, minutesSaved: 225 },
+      { date: new Date(now - 1 * 86400000).toISOString(), questionsAnswered: 9, minutesSaved: 135 },
+    ],
   };
   await writeJson('metrics.json', metrics);
 
