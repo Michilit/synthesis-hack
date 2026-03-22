@@ -26,7 +26,7 @@ contract TippingSystem is Ownable, ReentrancyGuard {
         address tipper;    // address(0) when anonymous
         uint256 amount;
         Tier    tier;
-        bool    anonymous;
+        bool    isAnonymous;
         string  message;
         uint256 timestamp;
     }
@@ -76,7 +76,7 @@ contract TippingSystem is Ownable, ReentrancyGuard {
         uint256         amount,
         Tier            tier,
         string          message,
-        bool            anonymous
+        bool            isAnonymous
     );
 
     event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
@@ -141,7 +141,7 @@ contract TippingSystem is Ownable, ReentrancyGuard {
             tipper:    tipperAddr,
             amount:    msg.value,
             tier:      tier,
-            anonymous: anon,
+            isAnonymous: anon,
             message:   message,
             timestamp: block.timestamp
         }));
