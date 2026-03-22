@@ -11,6 +11,7 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 ///         on-chain reputation and badges — not direct payment. This preserves
 ///         the open-source ethos: prestige is the primary motivator.
 ///         A mock yield accrues at ~5% APY while funds sit in escrow.
+///         Disputes are resolved by a 2-of-3 arbitrator multisig.
 contract BribeEscrow is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
     // Types
@@ -24,7 +25,7 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
         Reviewed,   // 3 – owner reviewed (intermediate, used during re-assign flows)
         Released,   // 4 – funds released to contributor
         Refunded,   // 5 – funds returned to briber
-        Disputed    // 6 – briber disputed delivery, awaiting arbitrator
+        Disputed    // 6 – briber disputed delivery, awaiting arbitrators
     }
 
     /// @notice A single escrow record.
@@ -37,7 +38,6 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
         uint256      minimumBribe;
         uint256      deadline;
         EscrowState  state;
-        address      arbitrator;
         uint256      yieldAccrued;
         uint256      depositTime;
     }
@@ -66,8 +66,17 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     /// @notice All escrows keyed by ID.
     mapping(uint256 => Escrow) public escrows;
 
-    /// @notice Address authorised to resolve disputes.
-    address public arbitrator;
+    /// @notice The three arbitrators for dispute resolution (2-of-3 multisig).
+    address[3] public arbitrators;
+
+    /// @notice Per-escrow per-arbitrator vote record: escrowId => arbitrator => hasVoted.
+    mapping(uint256 => mapping(address => bool)) public disputeVotes;
+
+    /// @notice Number of votes to release funds to treasury for each disputed escrow.
+    mapping(uint256 => uint256) public disputeVotesForRelease;
+
+    /// @notice Number of votes to refund the briber for each disputed escrow.
+    mapping(uint256 => uint256) public disputeVotesForRefund;
 
     /// @dev Ordered list of active (non-terminal) escrow IDs.
     uint256[] private _activeEscrowIds;
@@ -90,10 +99,11 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     event EscrowReleased(uint256 indexed escrowId, address indexed treasury, uint256 amount, address indexed contributor);
     event EscrowRefunded(uint256 indexed escrowId, address indexed briber, uint256 amount);
     event DisputeRaised(uint256 indexed escrowId, address indexed briber);
+    event DisputeVoteCast(uint256 indexed escrowId, address indexed arbitrator, bool releaseToTreasury);
     event DisputeResolved(uint256 indexed escrowId, bool releasedToTreasury);
     event StateChanged(uint256 indexed escrowId, EscrowState oldState, EscrowState newState);
     event MinimumBribeUpdated(uint256 newMinimum);
-    event ArbitratorUpdated(address indexed newArbitrator);
+    event ArbitratorsUpdated(address[3] newArbitrators);
     event TreasuryUpdated(address indexed newTreasury);
 
     // -------------------------------------------------------------------------
@@ -105,10 +115,14 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     error InvalidStateTransition(uint256 escrowId, EscrowState current, EscrowState required);
     error NotAssignedContributor(uint256 escrowId, address caller);
     error NotBriber(uint256 escrowId, address caller);
-    error NotArbitrator(address caller);
+    error NotAnArbitrator(address caller);
+    error AlreadyVoted(uint256 escrowId, address arbitrator);
+    error VotingNotOpen(uint256 escrowId);
     error TransferFailed(address to, uint256 amount);
     error ZeroAddress();
     error DeadlinePassed(uint256 escrowId);
+    error DescriptionTooLong();
+    error InvalidCharacter();
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -117,17 +131,17 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     /// @param initialOwner    Contract owner (acts as agent/admin).
     /// @param _treasury       Treasury address — all released funds flow here.
     /// @param _minimumBribe   Initial minimum bribe in wei.
-    /// @param _arbitrator     Initial arbitrator address.
+    /// @param _arbitrators    The three arbitrator addresses for 2-of-3 dispute resolution.
     constructor(
         address initialOwner,
         address payable _treasury,
         uint256 _minimumBribe,
-        address _arbitrator
+        address[3] memory _arbitrators
     ) Ownable(initialOwner) {
         if (_treasury == address(0)) revert ZeroAddress();
         treasury     = _treasury;
         minimumBribe = _minimumBribe;
-        arbitrator   = _arbitrator;
+        arbitrators  = _arbitrators;
         _escrowCounter = 1;
     }
 
@@ -136,6 +150,12 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
         if (_treasury == address(0)) revert ZeroAddress();
         treasury = _treasury;
         emit TreasuryUpdated(_treasury);
+    }
+
+    /// @notice Replace all three arbitrators atomically.
+    function setArbitrators(address[3] calldata _arbitrators) external onlyOwner {
+        arbitrators = _arbitrators;
+        emit ArbitratorsUpdated(_arbitrators);
     }
 
     // -------------------------------------------------------------------------
@@ -152,6 +172,8 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
         nonReentrant
         returns (uint256 escrowId)
     {
+        _validateDescription(featureDescription);
+
         if (msg.value < minimumBribe) {
             revert BelowMinimumBribe(msg.value, minimumBribe);
         }
@@ -168,7 +190,6 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
             minimumBribe:        minimumBribe,
             deadline:            deadline,
             state:               EscrowState.Deposited,
-            arbitrator:          arbitrator,
             yieldAccrued:        0,
             depositTime:         block.timestamp
         });
@@ -188,13 +209,6 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     function setMinimumBribe(uint256 minimum) external onlyOwner {
         minimumBribe = minimum;
         emit MinimumBribeUpdated(minimum);
-    }
-
-    /// @notice Update the arbitrator address.
-    function setArbitrator(address _arbitrator) external onlyOwner {
-        if (_arbitrator == address(0)) revert ZeroAddress();
-        arbitrator = _arbitrator;
-        emit ArbitratorUpdated(_arbitrator);
     }
 
     /// @notice Assign a contributor to an escrow in Deposited state.
@@ -335,7 +349,7 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Dispute a delivery. Only the original briber may call.
-    /// @dev    Moves escrow from Delivered to Disputed. Arbitrator resolves.
+    /// @dev    Moves escrow from Delivered to Disputed. Arbitrators then vote to resolve.
     function disputeDelivery(uint256 escrowId) external {
         Escrow storage e = _requireEscrow(escrowId);
         if (e.briber != msg.sender) revert NotBriber(escrowId, msg.sender);
@@ -351,44 +365,50 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     }
 
     // -------------------------------------------------------------------------
-    // External – Arbitrator
+    // External – Arbitrators (2-of-3 multisig)
     // -------------------------------------------------------------------------
 
-    /// @notice Resolve a disputed escrow.
-    /// @param escrowId              The escrow to resolve.
-    /// @param releaseToContributor  If true, pay contributor. If false, refund briber.
-    function resolveDispute(uint256 escrowId, bool releaseToContributor)
+    /// @notice Cast a vote to resolve a disputed escrow.
+    /// @dev    Callable only by one of the three registered arbitrators.
+    ///         When two arbitrators agree on the same outcome the resolution executes.
+    /// @param escrowId          The disputed escrow.
+    /// @param releaseToTreasury If true, vote to release funds to treasury (contributor wins).
+    ///                          If false, vote to refund the briber.
+    function voteOnDispute(uint256 escrowId, bool releaseToTreasury)
         external
         nonReentrant
     {
-        if (msg.sender != arbitrator) revert NotArbitrator(msg.sender);
+        // Verify caller is one of the three arbitrators
+        bool isArbitrator = false;
+        for (uint256 i = 0; i < 3; i++) {
+            if (arbitrators[i] == msg.sender) {
+                isArbitrator = true;
+                break;
+            }
+        }
+        if (!isArbitrator) revert NotAnArbitrator(msg.sender);
 
         Escrow storage e = _requireEscrow(escrowId);
-        if (e.state != EscrowState.Disputed) {
-            revert InvalidStateTransition(escrowId, e.state, EscrowState.Disputed);
+        if (e.state != EscrowState.Disputed) revert VotingNotOpen(escrowId);
+
+        if (disputeVotes[escrowId][msg.sender]) revert AlreadyVoted(escrowId, msg.sender);
+
+        // Record the vote
+        disputeVotes[escrowId][msg.sender] = true;
+
+        emit DisputeVoteCast(escrowId, msg.sender, releaseToTreasury);
+
+        if (releaseToTreasury) {
+            disputeVotesForRelease[escrowId] += 1;
+        } else {
+            disputeVotesForRefund[escrowId] += 1;
         }
 
-        EscrowState old = e.state;
-        _removeFromActive(escrowId);
-
-        uint256 yieldAmount = getYieldAccrued(escrowId);
-        e.yieldAccrued = yieldAmount;
-        uint256 payout = e.amount + yieldAmount;
-
-        if (releaseToContributor) {
-            // Contributor wins dispute: funds still go to Treasury (contributor gets reputation)
-            e.state = EscrowState.Released;
-            emit StateChanged(escrowId, old, EscrowState.Released);
-            emit EscrowReleased(escrowId, treasury, payout, e.assignedContributor);
-            emit DisputeResolved(escrowId, true);
-            _sendEth(treasury, payout);
-        } else {
-            // Briber wins dispute: full refund to briber
-            e.state = EscrowState.Refunded;
-            emit StateChanged(escrowId, old, EscrowState.Refunded);
-            emit EscrowRefunded(escrowId, e.briber, payout);
-            emit DisputeResolved(escrowId, false);
-            _sendEth(payable(e.briber), payout);
+        // Check if quorum (2 votes) reached for either outcome
+        if (disputeVotesForRelease[escrowId] >= 2) {
+            _resolveDisputeRelease(escrowId, e);
+        } else if (disputeVotesForRefund[escrowId] >= 2) {
+            _resolveDisputeRefund(escrowId, e);
         }
     }
 
@@ -428,6 +448,49 @@ contract BribeEscrow is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
+
+    /// @dev Resolves a dispute in favour of the treasury/contributor (2 release votes reached).
+    function _resolveDisputeRelease(uint256 escrowId, Escrow storage e) internal {
+        EscrowState old = e.state;
+        _removeFromActive(escrowId);
+
+        uint256 yieldAmount = getYieldAccrued(escrowId);
+        e.yieldAccrued = yieldAmount;
+        uint256 payout = e.amount + yieldAmount;
+
+        e.state = EscrowState.Released;
+        emit StateChanged(escrowId, old, EscrowState.Released);
+        emit EscrowReleased(escrowId, treasury, payout, e.assignedContributor);
+        emit DisputeResolved(escrowId, true);
+
+        _sendEth(treasury, payout);
+    }
+
+    /// @dev Resolves a dispute in favour of the briber (2 refund votes reached).
+    function _resolveDisputeRefund(uint256 escrowId, Escrow storage e) internal {
+        EscrowState old = e.state;
+        _removeFromActive(escrowId);
+
+        uint256 yieldAmount = getYieldAccrued(escrowId);
+        e.yieldAccrued = yieldAmount;
+        uint256 payout = e.amount + yieldAmount;
+
+        e.state = EscrowState.Refunded;
+        emit StateChanged(escrowId, old, EscrowState.Refunded);
+        emit EscrowRefunded(escrowId, e.briber, payout);
+        emit DisputeResolved(escrowId, false);
+
+        _sendEth(payable(e.briber), payout);
+    }
+
+    /// @dev Validate a feature description for length and null-byte injection.
+    function _validateDescription(string calldata desc) internal pure {
+        bytes calldata b = bytes(desc);
+        if (b.length > 500) revert DescriptionTooLong();
+        for (uint256 i = 0; i < b.length; i++) {
+            if (b[i] == 0x00) revert InvalidCharacter();
+        }
+    }
 
     /// @dev Returns a storage reference to an escrow, reverting if ID 0 or
     ///      the escrow has never been initialised (briber == address(0)).

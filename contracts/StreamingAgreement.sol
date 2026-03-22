@@ -8,8 +8,9 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 /// @notice Payers deposit ETH and funds accrue to the recipient at a fixed
 ///         rate per second. The payer may top up at any time. SLA breaches
 ///         can be reported by anyone and confirmed by the owner, who may then
-///         pause the stream. Cancellation requires a notice period before
-///         the remaining balance is refunded.
+///         pause the stream. When a stream is paused the amount accrued up to
+///         the pause point is snapshotted and remains claimable. Cancellation
+///         requires a notice period before the remaining balance is refunded.
 contract StreamingAgreement is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
     // Types
@@ -32,6 +33,7 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
         uint256         cancellationNoticePeriod; // seconds
         uint256         cancellationRequestedAt;  // 0 if not requested
         string          lastBreachDescription;
+        uint256         accruedAtPause;           // snapshot of claimable amount at pause time
     }
 
     // -------------------------------------------------------------------------
@@ -141,7 +143,8 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
             paused:                   false,
             cancellationNoticePeriod: cancellationNoticePeriod,
             cancellationRequestedAt:  0,
-            lastBreachDescription:    ""
+            lastBreachDescription:    "",
+            accruedAtPause:           0
         });
 
         _activeAgreementIds.push(agreementId);
@@ -193,6 +196,9 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
         if (accrued > 0) {
             a.totalClaimed       += accrued;
             a.lastClaimedTime     = block.timestamp;
+            if (a.paused) {
+                a.accruedAtPause = 0;
+            }
             _sendEth(a.recipient, accrued);
             emit FundsClaimed(agreementId, a.recipient, accrued);
         }
@@ -214,6 +220,8 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Claim all accrued (but unclaimed) streamed ETH.
+    /// @dev    When the stream is paused, the snapshotted accruedAtPause amount
+    ///         is claimable and is cleared after a successful claim.
     function claim(uint256 agreementId) external nonReentrant {
         Agreement storage a = _requireActive(agreementId);
         if (a.recipient != msg.sender) revert NotRecipient(agreementId, msg.sender);
@@ -221,8 +229,15 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
         uint256 amount = claimableAmount(agreementId);
         if (amount == 0) revert NothingToClaim(agreementId);
 
-        a.totalClaimed      += amount;
-        a.lastClaimedTime    = block.timestamp;
+        a.totalClaimed += amount;
+
+        // If the stream is paused we consumed the snapshot; clear it.
+        // lastClaimedTime is not advanced while paused (resumeStream handles that).
+        if (a.paused) {
+            a.accruedAtPause = 0;
+        } else {
+            a.lastClaimedTime = block.timestamp;
+        }
 
         emit FundsClaimed(agreementId, msg.sender, amount);
         _sendEth(a.recipient, amount);
@@ -259,29 +274,29 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
     }
 
     /// @notice Pause fund streaming for an agreement.
-    ///         While paused, `lastClaimedTime` is frozen so no new accrual occurs.
+    ///         The amount accrued up to this point is snapshotted in accruedAtPause
+    ///         so it remains claimable even while the stream is frozen.
     function pauseStream(uint256 agreementId) external onlyOwner {
         Agreement storage a = _requireActive(agreementId);
         if (a.paused) revert AgreementAlreadyPaused(agreementId);
 
-        // Snapshot the accrued amount by advancing lastClaimedTime to now
-        // so that no time elapses while paused. Any accrued so far is preserved.
-        // (The recipient can still claim whatever was earned up to this point.)
+        // Snapshot the amount earned so far before freezing the stream.
+        a.accruedAtPause = claimableAmount(agreementId);
         a.paused = true;
-        // We do NOT advance lastClaimedTime here; claimable is still collectible
-        // but the stream won't accrue further once paused (see claimableAmount).
 
         emit StreamPaused(agreementId);
     }
 
     /// @notice Resume a paused stream.
-    ///         Advances lastClaimedTime to now so the paused duration is skipped.
+    ///         Advances lastClaimedTime to now so the paused duration is not
+    ///         double-counted, and clears the accruedAtPause snapshot.
     function resumeStream(uint256 agreementId) external onlyOwner {
         Agreement storage a = _requireActive(agreementId);
         if (!a.paused) revert AgreementNotPaused(agreementId);
 
-        // Skip the paused duration by moving the clock forward
+        // Skip the paused duration by moving the clock forward.
         a.lastClaimedTime = block.timestamp;
+        a.accruedAtPause  = 0;
         a.paused          = false;
 
         emit StreamResumed(agreementId);
@@ -292,27 +307,22 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
     // -------------------------------------------------------------------------
 
     /// @notice Returns the ETH (in wei) that the recipient can currently claim.
-    /// @dev    = min(elapsed * ratePerSecond, remaining unclaimed balance)
-    ///           elapsed is 0 when the stream is paused.
+    /// @dev    When paused:  returns accruedAtPause (snapshotted at pause time).
+    ///         When active:  min(elapsed * ratePerSecond, remaining unclaimed balance).
     function claimableAmount(uint256 agreementId) public view returns (uint256) {
         Agreement storage a = _requireAgreement(agreementId);
 
-        if (!a.active || a.paused) {
-            // If paused: no new accrual, but existing accrual is still claimable.
-            // We return the amount accrued up to when the stream was paused,
-            // which is whatever was earned before lastClaimedTime was last set.
-            // Since lastClaimedTime is not advanced on pause, we still compute
-            // time-elapsed; the "paused" flag merely stops future accumulation.
-            // To keep it simple: paused streams can still be claimed up to pause point.
-            if (a.paused) {
-                // Accrual stopped; return 0 as nothing new is accruing
-                return 0;
-            }
+        if (!a.active) {
             return 0;
         }
 
-        uint256 elapsed  = block.timestamp - a.lastClaimedTime;
-        uint256 accrued  = elapsed * a.ratePerSecond;
+        if (a.paused) {
+            // Return the amount that was accrued at the moment the stream was paused.
+            return a.accruedAtPause;
+        }
+
+        uint256 elapsed   = block.timestamp - a.lastClaimedTime;
+        uint256 accrued   = elapsed * a.ratePerSecond;
         uint256 remaining = a.totalDeposited - a.totalClaimed;
 
         return accrued < remaining ? accrued : remaining;

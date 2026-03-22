@@ -2,6 +2,11 @@ import { ethers } from 'hardhat';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 
+if (!process.env.PRIVATE_KEY) {
+  console.error('ERROR: PRIVATE_KEY not set');
+  process.exit(1);
+}
+
 const DEPLOYMENTS_DIR = path.join(process.cwd(), 'deployments');
 
 async function main(): Promise<void> {
@@ -10,8 +15,6 @@ async function main(): Promise<void> {
   const networkName = network.name === 'unknown' ? 'localhost' : network.name;
 
   console.log(`\nDeploying DPI Guardians contracts to ${networkName}`);
-  console.log(`Deployer: ${deployer.address}`);
-  console.log(`Balance: ${ethers.formatEther(await ethers.provider.getBalance(deployer.address))} ETH\n`);
 
   // 1. Deploy Treasury
   console.log('Deploying Treasury...');
@@ -30,11 +33,18 @@ async function main(): Promise<void> {
   console.log(`  TippingSystem deployed at: ${tippingAddress}`);
 
   // 3. Deploy BribeEscrow
+  // constructor: (initialOwner, treasury, minimumBribe, arbitrators[3])
+  // Using deployer as all three arbitrators for the demo deployment.
   console.log('Deploying BribeEscrow...');
   const minimumBribe = ethers.parseEther('0.01');
   const BribeFactory = await ethers.getContractFactory('BribeEscrow');
-  // constructor: (initialOwner, treasury, minimumBribe, arbitrator)
-  const bribeEscrow = await BribeFactory.deploy(deployer.address, treasuryAddress, minimumBribe, deployer.address);
+  const arbitrators: [string, string, string] = [deployer.address, deployer.address, deployer.address];
+  const bribeEscrow = await BribeFactory.deploy(
+    deployer.address,
+    treasuryAddress,
+    minimumBribe,
+    arbitrators,
+  );
   await bribeEscrow.waitForDeployment();
   const bribeEscrowAddress = await bribeEscrow.getAddress();
   console.log(`  BribeEscrow deployed at: ${bribeEscrowAddress}`);
@@ -59,7 +69,6 @@ async function main(): Promise<void> {
   const deployment = {
     network: networkName,
     timestamp: new Date().toISOString(),
-    deployer: deployer.address,
     contracts: {
       Treasury: treasuryAddress,
       TippingSystem: tippingAddress,

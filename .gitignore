@@ -15,8 +15,7 @@ typechain-types/
 webapp/dist/
 
 # Hardhat
-deployments/localhost.json
-deployments/hardhat.json
+deployments/
 
 # Data files (may contain private keys or sensitive state)
 data/agent-identities.json

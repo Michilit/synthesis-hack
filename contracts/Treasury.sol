@@ -3,13 +3,14 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
 
 /// @title Treasury - Multi-sig spending governance for DPI Guardians
 /// @notice Small amounts can be auto-spent by the owner alone.
 ///         Larger amounts require MULTISIG_REQUIRED trustee approvals
 ///         before execution. Supports both crypto yield and RWA allocations
 ///         for a diversified, sustainable treasury strategy.
-contract Treasury is Ownable, ReentrancyGuard {
+contract Treasury is Ownable, ReentrancyGuard, Pausable {
     // -------------------------------------------------------------------------
     // Types
     // -------------------------------------------------------------------------
@@ -55,6 +56,7 @@ contract Treasury is Ownable, ReentrancyGuard {
         address[]         approvals;
         bool              executed;
         uint256           deadline;
+        bool              requiresHumanApproval;
     }
 
     /// @notice An immutable record of a completed spend.
@@ -66,12 +68,21 @@ contract Treasury is Ownable, ReentrancyGuard {
         address          recipient;
     }
 
+    /// @notice A record of an agent action for auditability.
+    struct AgentAction {
+        uint256 agentTokenId;
+        string  actionType;
+        uint256 timestamp;
+        string  details;
+        address initiator;
+    }
+
     // -------------------------------------------------------------------------
     // Constants
     // -------------------------------------------------------------------------
 
     /// @notice Maximum amount (in wei) that the owner may spend without trustee votes.
-    uint256 public constant AUTO_SPEND_THRESHOLD = 0.1 ether;
+    uint256 public constant AUTO_SPEND_THRESHOLD = 0.01 ether;
 
     /// @notice Number of trustee approvals required to execute a proposal.
     uint256 public constant MULTISIG_REQUIRED = 2;
@@ -112,6 +123,18 @@ contract Treasury is Ownable, ReentrancyGuard {
     /// @notice Cumulative ETH received by this contract.
     uint256 public totalReceived;
 
+    /// @notice Per-agent monthly spending cap in wei, keyed by ERC8004 tokenId.
+    mapping(uint256 => uint256) public agentSpendingCaps;
+
+    /// @notice Amount an agent has spent in the current month, keyed by ERC8004 tokenId.
+    mapping(uint256 => uint256) public agentSpentThisMonth;
+
+    /// @notice Timestamp when the current monthly window resets, keyed by ERC8004 tokenId.
+    mapping(uint256 => uint256) public agentSpendingResetTime;
+
+    /// @notice Log of all agent actions for auditability.
+    AgentAction[] public agentActionLog;
+
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
@@ -139,6 +162,8 @@ contract Treasury is Ownable, ReentrancyGuard {
     event RWAAllocationUpdated(uint256 indexed allocationId, uint256 newAmount);
     event TrusteeAdded(address indexed trustee);
     event TrusteeRemoved(address indexed trustee);
+    event AgentSpendingCapSet(uint256 indexed agentTokenId, uint256 cap);
+    event AgentActionLogged(uint256 indexed agentTokenId, string actionType, uint256 timestamp);
 
     // -------------------------------------------------------------------------
     // Errors
@@ -161,6 +186,10 @@ contract Treasury is Ownable, ReentrancyGuard {
     error ConcentrationLimitExceeded(uint256 allocationBps, uint256 maxBps);
     error AllocationNotFound(uint256 allocationId);
     error AllocationInactive(uint256 allocationId);
+    error AgentSpendingCapExceeded(uint256 agentTokenId, uint256 requested, uint256 remaining);
+    error HumanApprovalRequired(uint256 proposalId);
+    error DescriptionTooLong();
+    error InvalidCharacter();
 
     // -------------------------------------------------------------------------
     // Constructor
@@ -179,6 +208,20 @@ contract Treasury is Ownable, ReentrancyGuard {
     receive() external payable {
         totalReceived += msg.value;
         emit FundsReceived(msg.sender, msg.value);
+    }
+
+    // -------------------------------------------------------------------------
+    // External – Emergency pause (owner only)
+    // -------------------------------------------------------------------------
+
+    /// @notice Pause all critical operations in an emergency.
+    function emergencyPause() external onlyOwner {
+        _pause();
+    }
+
+    /// @notice Resume operations after an emergency pause.
+    function unpause() external onlyOwner {
+        _unpause();
     }
 
     // -------------------------------------------------------------------------
@@ -216,6 +259,44 @@ contract Treasury is Ownable, ReentrancyGuard {
     }
 
     // -------------------------------------------------------------------------
+    // External – Agent spending caps (owner only)
+    // -------------------------------------------------------------------------
+
+    /// @notice Set a monthly spending cap for an agent identified by ERC8004 tokenId.
+    /// @param agentTokenId  The ERC8004 token ID of the agent.
+    /// @param cap           Maximum wei the agent may spend per calendar month.
+    function setAgentSpendingCap(uint256 agentTokenId, uint256 cap) external onlyOwner {
+        agentSpendingCaps[agentTokenId] = cap;
+        emit AgentSpendingCapSet(agentTokenId, cap);
+    }
+
+    // -------------------------------------------------------------------------
+    // External – Agent action log (owner only)
+    // -------------------------------------------------------------------------
+
+    /// @notice Record an agent action for auditability.
+    /// @param agentTokenId  The ERC8004 token ID of the acting agent.
+    /// @param actionType    Short label for the action (e.g. "AUTO_SPEND").
+    /// @param details       Free-text details of the action.
+    function logAgentAction(
+        uint256 agentTokenId,
+        string calldata actionType,
+        string calldata details
+    ) external onlyOwner {
+        if (!_sanitizeDescription(details)) revert DescriptionTooLong();
+
+        agentActionLog.push(AgentAction({
+            agentTokenId: agentTokenId,
+            actionType:   actionType,
+            timestamp:    block.timestamp,
+            details:      details,
+            initiator:    msg.sender
+        }));
+
+        emit AgentActionLogged(agentTokenId, actionType, block.timestamp);
+    }
+
+    // -------------------------------------------------------------------------
     // External – Spending (owner only)
     // -------------------------------------------------------------------------
 
@@ -224,22 +305,41 @@ contract Treasury is Ownable, ReentrancyGuard {
     /// @param amount       Amount in wei (must be <= AUTO_SPEND_THRESHOLD).
     /// @param description  Free-text reason.
     /// @param category     Spending category.
+    /// @param agentTokenId ERC8004 token ID of the agent initiating the spend.
     function autoSpend(
         address payable recipient,
         uint256 amount,
         string calldata description,
-        SpendingCategory category
+        SpendingCategory category,
+        uint256 agentTokenId
     )
         external
         onlyOwner
         nonReentrant
+        whenNotPaused
     {
+        if (!_sanitizeDescription(description)) revert DescriptionTooLong();
         if (amount == 0)                        revert ZeroAmount();
         if (recipient == address(0))            revert ZeroAddress();
         if (amount > AUTO_SPEND_THRESHOLD)      revert AmountExceedsAutoThreshold(amount, AUTO_SPEND_THRESHOLD);
 
         uint256 available = address(this).balance - yieldBalance;
         if (amount > available)                 revert InsufficientBalance(amount, available);
+
+        // Enforce per-agent monthly spending cap
+        uint256 cap = agentSpendingCaps[agentTokenId];
+        if (cap > 0) {
+            // Reset monthly window if needed
+            if (block.timestamp >= agentSpendingResetTime[agentTokenId]) {
+                agentSpentThisMonth[agentTokenId] = 0;
+                agentSpendingResetTime[agentTokenId] = block.timestamp + 30 days;
+            }
+            uint256 spent = agentSpentThisMonth[agentTokenId];
+            if (spent + amount > cap) {
+                revert AgentSpendingCapExceeded(agentTokenId, amount, cap - spent);
+            }
+            agentSpentThisMonth[agentTokenId] = spent + amount;
+        }
 
         _spendingHistory.push(SpendingRecord({
             amount:      amount,
@@ -254,23 +354,26 @@ contract Treasury is Ownable, ReentrancyGuard {
     }
 
     /// @notice Create a multi-sig spending proposal (requires MULTISIG_REQUIRED trustee approvals).
-    /// @param recipient    Address to receive ETH if approved.
-    /// @param amount       Amount in wei.
-    /// @param description  Free-text reason.
-    /// @param category     Spending category.
-    /// @param deadline     Unix timestamp after which the proposal may not be executed.
-    /// @return proposalId  The newly created proposal ID.
+    /// @param recipient             Address to receive ETH if approved.
+    /// @param amount                Amount in wei.
+    /// @param description           Free-text reason.
+    /// @param category              Spending category.
+    /// @param deadline              Unix timestamp after which the proposal may not be executed.
+    /// @param requiresHumanApproval If true, execution requires both a trustee and the owner to approve.
+    /// @return proposalId           The newly created proposal ID.
     function proposeSpend(
         address payable recipient,
         uint256 amount,
         string calldata description,
         SpendingCategory category,
-        uint256 deadline
+        uint256 deadline,
+        bool requiresHumanApproval
     )
         external
         onlyOwner
         returns (uint256 proposalId)
     {
+        if (!_sanitizeDescription(description)) revert DescriptionTooLong();
         if (amount == 0)             revert ZeroAmount();
         if (recipient == address(0)) revert ZeroAddress();
 
@@ -278,14 +381,15 @@ contract Treasury is Ownable, ReentrancyGuard {
         unchecked { _proposalCounter++; }
 
         SpendingProposal storage p = proposals[proposalId];
-        p.id          = proposalId;
-        p.proposer    = msg.sender;
-        p.recipient   = recipient;
-        p.amount      = amount;
-        p.description = description;
-        p.category    = category;
-        p.executed    = false;
-        p.deadline    = deadline;
+        p.id                   = proposalId;
+        p.proposer             = msg.sender;
+        p.recipient            = recipient;
+        p.amount               = amount;
+        p.description          = description;
+        p.category             = category;
+        p.executed             = false;
+        p.deadline             = deadline;
+        p.requiresHumanApproval = requiresHumanApproval;
         // p.approvals is an empty dynamic array by default
 
         _proposalIds.push(proposalId);
@@ -322,9 +426,12 @@ contract Treasury is Ownable, ReentrancyGuard {
 
     /// @notice Execute an approved proposal, transferring ETH to the recipient.
     /// @dev    Requires at least MULTISIG_REQUIRED trustee approvals.
+    ///         If requiresHumanApproval is set, at least one approval must come
+    ///         from a trustee AND one from the owner.
     function executeProposal(uint256 proposalId)
         external
         nonReentrant
+        whenNotPaused
     {
         SpendingProposal storage p = _requireProposal(proposalId);
         if (p.executed) revert ProposalAlreadyExecuted(proposalId);
@@ -333,6 +440,21 @@ contract Treasury is Ownable, ReentrancyGuard {
         uint256 approvalCount = p.approvals.length;
         if (approvalCount < MULTISIG_REQUIRED) {
             revert InsufficientApprovals(proposalId, approvalCount, MULTISIG_REQUIRED);
+        }
+
+        // Human-override check: requires at least one trustee approval AND the owner's approval
+        if (p.requiresHumanApproval) {
+            bool hasTrusteeApproval = false;
+            bool hasOwnerApproval   = false;
+            address ownerAddr = owner();
+            for (uint256 i = 0; i < approvalCount; i++) {
+                address approver = p.approvals[i];
+                if (isTrustee[approver]) hasTrusteeApproval = true;
+                if (approver == ownerAddr) hasOwnerApproval = true;
+            }
+            if (!hasTrusteeApproval || !hasOwnerApproval) {
+                revert HumanApprovalRequired(proposalId);
+            }
         }
 
         uint256 available = address(this).balance - yieldBalance;
@@ -358,7 +480,7 @@ contract Treasury is Ownable, ReentrancyGuard {
 
     /// @notice Move ETH from the liquid balance into the mock yield vault.
     /// @dev    The ETH stays in this contract but is tracked as "yielding".
-    function depositToYield(uint256 amount) external onlyOwner nonReentrant {
+    function depositToYield(uint256 amount) external onlyOwner nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         uint256 liquid = address(this).balance - yieldBalance;
         if (amount > liquid) revert InsufficientBalance(amount, liquid);
@@ -394,7 +516,7 @@ contract Treasury is Ownable, ReentrancyGuard {
         AssetType assetType,
         uint256 amount,
         uint256 targetBps
-    ) external onlyOwner nonReentrant returns (uint256 allocationId) {
+    ) external onlyOwner nonReentrant whenNotPaused returns (uint256 allocationId) {
         if (amount == 0)                           revert ZeroAmount();
         if (targetBps > MAX_SINGLE_ASSET_BPS)      revert ConcentrationLimitExceeded(targetBps, MAX_SINGLE_ASSET_BPS);
 
@@ -520,6 +642,11 @@ contract Treasury is Ownable, ReentrancyGuard {
         return trustees;
     }
 
+    /// @notice Returns the full agent action log.
+    function getAgentActionLog() external view returns (AgentAction[] memory) {
+        return agentActionLog;
+    }
+
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
@@ -538,5 +665,17 @@ contract Treasury is Ownable, ReentrancyGuard {
     function _sendEth(address payable to, uint256 amount) internal {
         (bool success, ) = to.call{value: amount}("");
         if (!success) revert TransferFailed(to, amount);
+    }
+
+    /// @notice Validate a free-text description against injection and length limits.
+    /// @dev    Returns true if valid; reverts with a specific error if invalid.
+    ///         Rejects descriptions longer than 500 bytes or containing null bytes (0x00).
+    function _sanitizeDescription(string calldata desc) internal pure returns (bool valid) {
+        bytes calldata b = bytes(desc);
+        if (b.length > 500) revert DescriptionTooLong();
+        for (uint256 i = 0; i < b.length; i++) {
+            if (b[i] == 0x00) revert InvalidCharacter();
+        }
+        return true;
     }
 }
