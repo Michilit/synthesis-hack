@@ -22,5 +22,9 @@
     "scripts/**/*",
     "test/**/*"
   ],
-  "exclude": ["node_modules", "dist", "webapp", "artifacts", "cache"]
+  "exclude": ["node_modules", "dist", "webapp", "artifacts", "cache"],
+  "ts-node": {
+    "transpileOnly": true,
+    "files": true
+  }
 }
