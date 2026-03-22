@@ -33,7 +33,8 @@ async function main(): Promise<void> {
   console.log('Deploying BribeEscrow...');
   const minimumBribe = ethers.parseEther('0.01');
   const BribeFactory = await ethers.getContractFactory('BribeEscrow');
-  const bribeEscrow = await BribeFactory.deploy(deployer.address, minimumBribe, deployer.address);
+  // constructor: (initialOwner, treasury, minimumBribe, arbitrator)
+  const bribeEscrow = await BribeFactory.deploy(deployer.address, treasuryAddress, minimumBribe, deployer.address);
   await bribeEscrow.waitForDeployment();
   const bribeEscrowAddress = await bribeEscrow.getAddress();
   console.log(`  BribeEscrow deployed at: ${bribeEscrowAddress}`);
