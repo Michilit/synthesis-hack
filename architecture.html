@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DPI Agent Maintenance System — Architecture</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; background: #0a0a0f; color: #e0e0e0; overflow: hidden; }
+
+  #world {
+    position: absolute; top: 0; left: 0;
+    transform-origin: 0 0;
+  }
+
+  .layer {
+    position: absolute; border-radius: 16px; padding: 16px;
+  }
+  .layer-title {
+    font-size: 13px; font-weight: 700; letter-spacing: 1px;
+    text-transform: uppercase; margin-bottom: 12px; opacity: 0.8;
+  }
+
+  .node {
+    position: absolute; border-radius: 12px; padding: 12px 16px;
+    cursor: pointer; text-align: center;
+    transition: box-shadow 0.2s;
+    z-index: 10;
+    width: 175px;
+  }
+  .node:hover { box-shadow: 0 0 20px rgba(255,255,255,0.15); z-index: 100; }
+  .node-title { font-weight: 700; font-size: 13px; margin-bottom: 3px; white-space: nowrap; }
+  .node-desc { font-size: 10px; opacity: 0.65; line-height: 1.3; }
+
+  #connections {
+    position: absolute; top: 0; left: 0;
+    width: 2000px; height: 1200px;
+    pointer-events: none; z-index: 5;
+  }
+
+  .conn-line { fill: none; stroke-width: 2; opacity: 0.55; }
+  .conn-line:hover { opacity: 1; stroke-width: 3; }
+  .conn-line.animated { stroke-dasharray: 8 5; animation: flowDash 1.2s linear infinite; opacity: 0.7; }
+  @keyframes flowDash { to { stroke-dashoffset: -13; } }
+
+  .conn-arrow { opacity: 0.7; }
+
+  .conn-label {
+    font-size: 9px; fill: #aaa; text-anchor: middle;
+    pointer-events: none; font-family: 'Inter', sans-serif;
+  }
+
+  .tooltip {
+    position: fixed; background: #1a1a2e; border: 1px solid #444;
+    border-radius: 10px; padding: 14px 18px; max-width: 300px;
+    z-index: 1000; pointer-events: none; display: none;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.6);
+  }
+  .tooltip h3 { font-size: 14px; margin-bottom: 6px; }
+  .tooltip p { font-size: 11.5px; line-height: 1.55; opacity: 0.85; }
+
+  .legend {
+    position: fixed; bottom: 20px; left: 20px;
+    background: rgba(15,15,25,0.92); border: 1px solid #333;
+    border-radius: 12px; padding: 14px 18px; z-index: 500;
+    font-size: 11px; backdrop-filter: blur(12px);
+  }
+  .legend-item { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+  .legend-dot { width: 11px; height: 11px; border-radius: 3px; flex-shrink: 0; }
+
+  .controls {
+    position: fixed; top: 20px; right: 20px; z-index: 500;
+    display: flex; gap: 8px;
+  }
+  .controls button {
+    background: rgba(15,15,25,0.92); border: 1px solid #333;
+    color: #e0e0e0; padding: 8px 14px; border-radius: 8px;
+    cursor: pointer; font-size: 12px; backdrop-filter: blur(12px);
+  }
+  .controls button:hover { background: rgba(40,40,60,0.92); }
+
+  .title-bar { position: fixed; top: 20px; left: 20px; z-index: 500; }
+  .title-bar h1 {
+    font-size: 20px; font-weight: 800;
+    background: linear-gradient(135deg, #7c5cfc, #38bdf8);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .title-bar p { font-size: 11px; opacity: 0.45; margin-top: 3px; }
+</style>
+</head>
+<body>
+
+<div class="title-bar">
+  <h1>DPI Agent Maintenance System</h1>
+  <p>Scroll to zoom, drag to pan, hover nodes for details</p>
+</div>
+
+<div class="controls">
+  <button onclick="resetView()">Reset View</button>
+  <button onclick="toggleFlow()">Toggle Flow</button>
+  <button onclick="toggleLabels()">Toggle Labels</button>
+</div>
+
+<div id="world">
+  <svg id="connections"></svg>
+</div>
+
+<div class="tooltip" id="tooltip"></div>
+
+<div class="legend">
+  <div style="font-weight:700; margin-bottom:6px;">Legend</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#7c5cfc;"></div> Agent Swarm</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#38bdf8;"></div> Revenue Streams</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f59e0b;"></div> Treasury Management</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#10b981;"></div> Outputs & Services</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ec4899;"></div> Identity & Reputation</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#94a3b8;"></div> Human Actors</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#6366f1;"></div> External Integrations</div>
+</div>
+
+<script>
+// ═══ DATA ═══════════════════════════════════════════
+const NW = 175; // fixed node width
+const NH = 52;  // approx node height
+
+const LAYERS = {
+  agents:   { color: '#7c5cfc', bg: 'rgba(124,92,252,0.07)', border: 'rgba(124,92,252,0.3)', x: 40,   y: 60,  w: 500, h: 310, title: 'Agent Swarm' },
+  revenue:  { color: '#38bdf8', bg: 'rgba(56,189,248,0.07)',  border: 'rgba(56,189,248,0.3)', x: 580,  y: 60,  w: 430, h: 310, title: 'Revenue Streams' },
+  treasury: { color: '#f59e0b', bg: 'rgba(245,158,11,0.07)', border: 'rgba(245,158,11,0.3)', x: 1050, y: 60,  w: 430, h: 310, title: 'Treasury Management' },
+  outputs:  { color: '#10b981', bg: 'rgba(16,185,129,0.07)', border: 'rgba(16,185,129,0.3)', x: 40,   y: 410, w: 600, h: 270, title: 'Outputs & Services' },
+  identity: { color: '#ec4899', bg: 'rgba(236,72,153,0.07)', border: 'rgba(236,72,153,0.3)', x: 680,  y: 410, w: 340, h: 270, title: 'Identity & Reputation (ERC-8004)' },
+  humans:   { color: '#94a3b8', bg: 'rgba(148,163,184,0.07)',border: 'rgba(148,163,184,0.3)', x: 1060, y: 410, w: 420, h: 270, title: 'Human Actors' },
+  external: { color: '#6366f1', bg: 'rgba(99,102,241,0.07)', border: 'rgba(99,102,241,0.3)', x: 40,   y: 720, w: 1440, h: 110, title: 'External Integrations' },
+};
+
+// node x,y = top-left corner in world space
+const NODES = [
+  // Agents (inside layer)
+  { id: 'ma', layer: 'agents', x: 60,  y: 110, title: 'Maintainer Agent', desc: 'Core agent', detail: 'Maintains the DPI repository: reviews code, runs tests, manages contributions, keeps context files updated, broadcasts tasks to contributors. The central coordinator of the system.' },
+  { id: 'ca', layer: 'agents', x: 280, y: 110, title: 'Community Agent', desc: 'Marketing & outreach', detail: 'Develops the DPI community: highlights new projects, generates newsletters, manages referral links, broadcasts updates to relevant community members.' },
+  { id: 'sa', layer: 'agents', x: 60,  y: 195, title: 'Support Agent', desc: 'User assistance', detail: 'Helps anyone installing/using the DPI. Self-reflects on UX/DX/AX improvements. Learns from maintainer decisions to progressively reduce human burden.' },
+  { id: 'ta', layer: 'agents', x: 280, y: 195, title: 'Treasury Agent', desc: 'Fund management', detail: 'Manages the DPI treasury: financial projections, P&Ls, portfolio diversification, yield generation. Does daily/weekly rebalancing via Uniswap.' },
+  { id: 'ra', layer: 'agents', x: 170, y: 280, title: 'Review Agent', desc: 'Quality & certification', detail: 'Evaluates and tests contributions. Issues skill badges and certifications via ERC-8004. Battle-tested by a council of agents trained by past maintainers.' },
+
+  // Revenue
+  { id: 'tips',    layer: 'revenue', x: 600,  y: 110, title: 'Tipping System', desc: '3 tiers + open amount', detail: 'Maintainer agents request tips from agents using the repos. Suggested based on how critical usage is. Optional public display. Private/anonymous tipping supported.' },
+  { id: 'bribes',  layer: 'revenue', x: 600,  y: 195, title: 'Priority Bribes', desc: 'Premium development', detail: 'Companies bribe to prioritize features. Agent sets min bribe based on opportunity cost. Funds go to yield-generating escrow. Top devs compete to deliver.' },
+  { id: 'stream',  layer: 'revenue', x: 810,  y: 110, title: 'Fund Streaming', desc: 'SLA-based agreements', detail: 'Protocol Guild-like streaming over long periods. Protocols share revenue as long as SLA clauses are met (uptime, fix time). Board decides tailored SLAs once demand proven.' },
+  { id: 'referral',layer: 'revenue', x: 810,  y: 195, title: 'Referral Revenue', desc: 'Project showcases', detail: 'Community agent showcases projects built with the DPI. Referral links generate visibility/sales revenue for the treasury.' },
+
+  // Treasury
+  { id: 'escrow',  layer: 'treasury', x: 1070, y: 110, title: 'Yield Escrow', desc: 'Arkhai integration', detail: 'Bribe funds placed in yield-generating escrow (Arkhai Ecosystem Extensions). Earns yield while work is completed.' },
+  { id: 'multisig',layer: 'treasury', x: 1280, y: 110, title: 'Human Multisig', desc: 'Board trustees', detail: 'Human board trustees approve fund transfers over threshold via multisig. Provided briefing + code to execute.' },
+  { id: 'rebal',   layer: 'treasury', x: 1070, y: 195, title: 'Rebalancing', desc: 'Uniswap integration', detail: 'Daily/weekly rebalancing of treasury. Swaps volatile tokens for stables. Diversified yield positions.' },
+  { id: 'spending',layer: 'treasury', x: 1280, y: 195, title: 'Spending Control', desc: 'Locus integration', detail: 'Only below-threshold amounts spent without Board review. Automated guardrails on agent spending.' },
+
+  // Outputs
+  { id: 'maint',  layer: 'outputs', x: 60,  y: 460, title: 'Code Maintenance', desc: 'Testing, auditing, fixes', detail: 'Core output: keeping the DPI functional. Security audits, dependency updates, bug fixes, testing. Agent review + human oversight for critical changes.' },
+  { id: 'ux',     layer: 'outputs', x: 250, y: 460, title: 'UX/DX/AX Improvements', desc: 'Phased automation', detail: 'Support agent identifies improvements. Phased: human-informed first, then agent suggests with reasoning, iterates to minimal human input.' },
+  { id: 'ctx',    layer: 'outputs', x: 440, y: 460, title: 'Context MD File', desc: 'Always up-to-date', detail: 'Living doc with ALL discussions, contributions, info. Enables any agent to contribute with full context. Stored on Filecoin. Protected against poisoning.' },
+  { id: 'contrib',layer: 'outputs', x: 60,  y: 545, title: 'Contributor Board', desc: 'Recognition & gamification', detail: 'Public board of all contributions. Makes contributors findable. Recognition totems for tiers. Tied to reputation. The prestige engine.' },
+  { id: 'news',   layer: 'outputs', x: 250, y: 545, title: 'Newsletters', desc: 'Community updates', detail: 'Automated newsletters showcasing new projects built with the DPI, classified by category. Targeted by profile/interests.' },
+  { id: 'tasks',  layer: 'outputs', x: 440, y: 545, title: 'Task Board', desc: 'Easy to Expert', detail: 'Contribution opportunities ranked by difficulty. Entry point for new contributors building reputation.' },
+
+  // Identity
+  { id: 'aid',    layer: 'identity', x: 700, y: 460, title: 'Agent Identity', desc: 'ERC-8004 based', detail: 'Verifiable on-chain identity via ERC-8004. Enables trust in agent contributions. SelfAgent ID integration.' },
+  { id: 'crep',   layer: 'identity', x: 700, y: 545, title: 'Contributor Reputation', desc: 'Cross-DPI portable', detail: 'Success/failure track record. Interoperable across DPI communities. Public contributor repo any DPI can subscribe to.' },
+  { id: 'badges', layer: 'identity', x: 900, y: 500, title: 'Skill Badges', desc: 'Certifications', detail: 'Earned through battle-tested contributions. Approved by council of agents trained by past maintainers. Stored on ERC-8004.' },
+
+  // Humans
+  { id: 'core',  layer: 'humans', x: 1080, y: 460, title: 'Core Maintainers', desc: 'Review & train agents', detail: 'Human experts who review critical changes and train agents. Can cash out or donate back. Time commitment decreases as agents learn.' },
+  { id: 'devs',  layer: 'humans', x: 1280, y: 460, title: 'Contributors', desc: 'Build reputation', detail: 'Developers contributing for prestige. Compete on bribe tasks. New skills/info contributions are the holy grail — unpaid but highly publicized.' },
+  { id: 'board', layer: 'humans', x: 1080, y: 545, title: 'Board Trustees', desc: 'Governance & oversight', detail: 'Top contributors providing governance via multisig. Minimal time. Can cash out or not — incentivized to leave funds for runway.' },
+  { id: 'users', layer: 'humans', x: 1280, y: 545, title: 'DPI Users', desc: 'Projects & protocols', detail: 'Projects and protocols using the DPI. Tip maintainer agents. Bribe for priority features. Enter streaming agreements.' },
+
+  // External
+  { id: 'uniswap', layer: 'external', x: 60,   y: 755, title: 'Uniswap', desc: 'Treasury rebalancing', detail: 'Daily/weekly rebalancing of treasury assets across token pairs.' },
+  { id: 'selfid',  layer: 'external', x: 300,  y: 755, title: 'SelfAgent ID', desc: 'Agent identity', detail: 'Identity infrastructure for core maintainer agents.' },
+  { id: 'bankr',   layer: 'external', x: 540,  y: 755, title: 'Bankr LLM Gateway', desc: 'Inference payments', detail: 'Agents pay for their own inference costs through this gateway.' },
+  { id: 'locus',   layer: 'external', x: 780,  y: 755, title: 'Locus', desc: 'Spending control', detail: 'Spending limits so below-threshold amounts bypass Board.' },
+  { id: 'arkhai',  layer: 'external', x: 1020, y: 755, title: 'Arkhai', desc: 'Escrow extensions', detail: 'Yield-generating escrow contracts for bribe-funded development.' },
+  { id: 'filecoin',layer: 'external', x: 1260, y: 755, title: 'Filecoin', desc: 'Permanent storage', detail: 'Permanent verifiable storage for context files. Agent pays from treasury.' },
+];
+
+const CONNECTIONS = [
+  // Agent → Output (what they produce)
+  { from: 'ma', to: 'maint',   color: '#7c5cfc', label: 'maintains', animated: true },
+  { from: 'ma', to: 'ctx',     color: '#7c5cfc', label: 'updates' },
+  { from: 'ma', to: 'tasks',   color: '#7c5cfc', label: 'curates' },
+  { from: 'ca', to: 'news',    color: '#7c5cfc', label: 'generates' },
+  { from: 'ca', to: 'contrib', color: '#7c5cfc', label: 'manages' },
+  { from: 'sa', to: 'ux',      color: '#7c5cfc', label: 'improves' },
+  { from: 'ra', to: 'badges',  color: '#7c5cfc', label: 'issues' },
+
+  // Revenue → Treasury (money flows)
+  { from: 'tips',    to: 'escrow', color: '#38bdf8', label: 'funds',   animated: true },
+  { from: 'bribes',  to: 'escrow', color: '#38bdf8', label: 'escrow',  animated: true },
+  { from: 'stream',  to: 'rebal',  color: '#38bdf8', label: 'streams', animated: true },
+  { from: 'referral',to: 'rebal',  color: '#38bdf8', label: 'revenue' },
+
+  // Treasury → External integrations
+  { from: 'rebal',   to: 'uniswap', color: '#f59e0b', label: 'swaps' },
+  { from: 'spending',to: 'locus',   color: '#f59e0b', label: 'enforces' },
+  { from: 'escrow',  to: 'arkhai',  color: '#f59e0b', label: 'yield' },
+
+  // Identity flows
+  { from: 'selfid', to: 'aid',  color: '#ec4899', label: 'provides ID' },
+  { from: 'aid',    to: 'ma',   color: '#ec4899', label: 'authenticates' },
+  { from: 'crep',   to: 'devs', color: '#ec4899', label: 'reputation' },
+
+  // Human oversight
+  { from: 'core',  to: 'ma',      color: '#94a3b8', label: 'reviews' },
+  { from: 'core',  to: 'ra',      color: '#94a3b8', label: 'trains' },
+  { from: 'board', to: 'multisig',color: '#94a3b8', label: 'approves' },
+  { from: 'devs',  to: 'tasks',   color: '#94a3b8', label: 'contribute' },
+  { from: 'users', to: 'tips',    color: '#94a3b8', label: 'tip',    animated: true },
+  { from: 'users', to: 'bribes',  color: '#94a3b8', label: 'bribe' },
+
+  // Infra
+  { from: 'bankr', to: 'ma',      color: '#6366f1', label: 'inference' },
+  { from: 'ctx',   to: 'filecoin',color: '#6366f1', label: 'stores' },
+
+  // Bribe flow
+  { from: 'ma', to: 'devs', color: '#f59e0b', label: 'broadcasts tasks' },
+];
+
+// ═══ STATE ══════════════════════════════════════════
+let panX = 0, panY = 0, scale = 1;
+let isDragging = false, dragStartX, dragStartY;
+let showFlow = true;
+let showLabels = true;
+
+const world = document.getElementById('world');
+const svgEl = document.getElementById('connections');
+const tooltip = document.getElementById('tooltip');
+
+// ═══ RENDERING ═════════════════════════════════════
+
+// Build node lookup
+const nodeMap = {};
+NODES.forEach(n => { nodeMap[n.id] = n; });
+
+function getNodeCenter(id) {
+  const n = nodeMap[id];
+  return { x: n.x + NW / 2, y: n.y + NH / 2 };
+}
+
+function getEdgePoint(fromId, toId) {
+  // Returns the point on fromNode's edge closest to toNode's center
+  const fc = getNodeCenter(fromId);
+  const tc = getNodeCenter(toId);
+  const dx = tc.x - fc.x;
+  const dy = tc.y - fc.y;
+  const hw = NW / 2;
+  const hh = NH / 2;
+
+  // Find intersection with node rectangle
+  let ex, ey;
+  const absDx = Math.abs(dx);
+  const absDy = Math.abs(dy);
+
+  if (absDx * hh > absDy * hw) {
+    // exits left or right
+    ex = fc.x + Math.sign(dx) * hw;
+    ey = fc.y + dy * (hw / absDx);
+  } else {
+    // exits top or bottom
+    ey = fc.y + Math.sign(dy) * hh;
+    ex = fc.x + dx * (hh / absDy);
+  }
+  return { x: ex, y: ey };
+}
+
+function buildSVG() {
+  // Arrow marker defs
+  let html = `<defs>`;
+  const colors = ['#7c5cfc','#38bdf8','#f59e0b','#10b981','#ec4899','#94a3b8','#6366f1'];
+  colors.forEach(c => {
+    const id = 'arrow-' + c.replace('#','');
+    html += `<marker id="${id}" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L8,3 L0,6 Z" fill="${c}" opacity="0.7"/>
+    </marker>`;
+  });
+  html += `</defs>`;
+
+  // Draw connections
+  CONNECTIONS.forEach((c, i) => {
+    const fp = getEdgePoint(c.from, c.to);
+    const tp = getEdgePoint(c.to, c.from);
+
+    // Cubic bezier with control points offset toward the midpoint
+    const mx = (fp.x + tp.x) / 2;
+    const my = (fp.y + tp.y) / 2;
+    const dx = tp.x - fp.x;
+    const dy = tp.y - fp.y;
+    const dist = Math.sqrt(dx*dx + dy*dy);
+
+    // Offset control points perpendicular to the line slightly, and along it
+    const curvature = Math.min(dist * 0.3, 60);
+    let cx1, cy1, cx2, cy2;
+
+    if (Math.abs(dy) > Math.abs(dx)) {
+      // Mostly vertical — curve horizontally
+      cx1 = fp.x; cy1 = fp.y + Math.sign(dy) * curvature;
+      cx2 = tp.x; cy2 = tp.y - Math.sign(dy) * curvature;
+    } else {
+      // Mostly horizontal — curve vertically
+      cx1 = fp.x + Math.sign(dx) * curvature; cy1 = fp.y;
+      cx2 = tp.x - Math.sign(dx) * curvature; cy2 = tp.y;
+    }
+
+    const markerId = 'arrow-' + c.color.replace('#','');
+    const animClass = (c.animated && showFlow) ? ' animated' : '';
+
+    html += `<path class="conn-line${animClass}" d="M${fp.x},${fp.y} C${cx1},${cy1} ${cx2},${cy2} ${tp.x},${tp.y}" stroke="${c.color}" marker-end="url(#${markerId})" data-idx="${i}"/>`;
+
+    // Label at midpoint
+    if (showLabels && c.label) {
+      const lx = (fp.x + 3*mx + tp.x) / 5;
+      const ly = (fp.y + 3*my + tp.y) / 5 - 6;
+      html += `<text class="conn-label" x="${lx}" y="${ly}">${c.label}</text>`;
+    }
+  });
+
+  svgEl.innerHTML = html;
+}
+
+function buildDOM() {
+  // Remove old layers/nodes
+  world.querySelectorAll('.layer, .node').forEach(el => el.remove());
+
+  // Layers
+  Object.entries(LAYERS).forEach(([id, l]) => {
+    const div = document.createElement('div');
+    div.className = 'layer';
+    div.style.cssText = `left:${l.x}px; top:${l.y}px; width:${l.w}px; height:${l.h}px; background:${l.bg}; border:1px solid ${l.border};`;
+    div.innerHTML = `<div class="layer-title" style="color:${l.color}">${l.title}</div>`;
+    world.appendChild(div);
+  });
+
+  // Nodes
+  NODES.forEach(n => {
+    const layer = LAYERS[n.layer];
+    const div = document.createElement('div');
+    div.className = 'node';
+    div.style.cssText = `left:${n.x}px; top:${n.y}px; width:${NW}px; background:rgba(10,10,20,0.85); border:1.5px solid ${layer.border};`;
+    div.innerHTML = `<div class="node-title" style="color:${layer.color}">${n.title}</div><div class="node-desc">${n.desc}</div>`;
+
+    div.addEventListener('mouseenter', (e) => {
+      tooltip.style.display = 'block';
+      tooltip.innerHTML = `<h3 style="color:${layer.color}">${n.title}</h3><p>${n.detail}</p>`;
+      positionTooltip(e);
+      // Highlight connected lines
+      highlightConnections(n.id, true);
+    });
+    div.addEventListener('mousemove', positionTooltip);
+    div.addEventListener('mouseleave', () => {
+      tooltip.style.display = 'none';
+      highlightConnections(n.id, false);
+    });
+
+    world.appendChild(div);
+  });
+
+  buildSVG();
+}
+
+function highlightConnections(nodeId, on) {
+  CONNECTIONS.forEach((c, i) => {
+    if (c.from === nodeId || c.to === nodeId) {
+      const path = svgEl.querySelector(`[data-idx="${i}"]`);
+      if (path) {
+        path.style.opacity = on ? '1' : '';
+        path.style.strokeWidth = on ? '3' : '';
+      }
+    }
+  });
+}
+
+function applyTransform() {
+  world.style.transform = `translate(${panX}px, ${panY}px) scale(${scale})`;
+}
+
+function positionTooltip(e) {
+  tooltip.style.left = Math.min(e.clientX + 14, window.innerWidth - 320) + 'px';
+  tooltip.style.top = Math.min(e.clientY + 14, window.innerHeight - 180) + 'px';
+}
+
+// ═══ INTERACTION ════════════════════════════════════
+
+document.body.addEventListener('mousedown', (e) => {
+  if (e.target.closest('.node, .controls, .legend')) return;
+  isDragging = true;
+  dragStartX = e.clientX - panX;
+  dragStartY = e.clientY - panY;
+  document.body.style.cursor = 'grabbing';
+});
+
+window.addEventListener('mousemove', (e) => {
+  if (!isDragging) return;
+  panX = e.clientX - dragStartX;
+  panY = e.clientY - dragStartY;
+  applyTransform();
+});
+
+window.addEventListener('mouseup', () => {
+  isDragging = false;
+  document.body.style.cursor = '';
+});
+
+document.body.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const factor = e.deltaY > 0 ? 0.92 : 1.08;
+  const newScale = Math.max(0.25, Math.min(3, scale * factor));
+
+  // Zoom toward cursor
+  const mx = e.clientX;
+  const my = e.clientY;
+  panX = mx - (mx - panX) * (newScale / scale);
+  panY = my - (my - panY) * (newScale / scale);
+  scale = newScale;
+  applyTransform();
+}, { passive: false });
+
+function resetView() {
+  scale = 0.82;
+  panX = 30;
+  panY = 10;
+  applyTransform();
+}
+
+function toggleFlow() {
+  showFlow = !showFlow;
+  buildSVG();
+}
+
+function toggleLabels() {
+  showLabels = !showLabels;
+  buildSVG();
+}
+
+// ═══ INIT ══════════════════════════════════════════
+buildDOM();
+resetView();
+</script>
+</body>
+</html>

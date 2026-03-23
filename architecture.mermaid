@@ -1,0 +1,117 @@
+---
+title: "DPI Agent Maintenance System — Architecture"
+---
+
+flowchart TB
+    subgraph IDENTITY["🪪 Identity & Reputation Layer (ERC-8004)"]
+        AID[Agent Identity]
+        CREP[Contributor Reputation]
+        BADGES[Skill Badges & Certifications]
+    end
+
+    subgraph AGENTS["🤖 Agent Swarm"]
+        MA[Maintainer Agent]
+        CA[Community Agent]
+        SA[Support Agent]
+        TA[Treasury Agent]
+        RA[Review Agent]
+    end
+
+    subgraph REVENUE["💰 Revenue Streams"]
+        TIPS[Tipping System\n3 Tiers + Open Amount]
+        BRIBES[Priority Bribes\nMinimum + Premium]
+        STREAM[Fund Streaming\nSLA-Based Agreements]
+        REFERRAL[Referral Revenue\nProject Showcases]
+    end
+
+    subgraph TREASURY["🏦 Treasury Management"]
+        ESCROW[Yield-Generating Escrow]
+        MULTI[Human Multisig\nBoard Trustees]
+        REBAL[Portfolio Rebalancing\nUniswap Integration]
+        SPEND[Spending Control\nLocus]
+    end
+
+    subgraph OUTPUTS["📦 Outputs & Services"]
+        MAINT[Code Maintenance\nTesting, Auditing, Fixes]
+        UX[UX/DX/AX Improvements]
+        CTX[Context MD File\nAlways Up-to-Date]
+        CONTRIB[Contributor Board\nRecognition & Gamification]
+        NEWS[Newsletters & Updates]
+        TASKS[Task Board\nEasy → Expert]
+    end
+
+    subgraph EXTERNAL["🔗 External Integrations"]
+        UNISWAP[Uniswap\nTreasury Rebalancing]
+        SELFID[SelfAgent ID\nAgent Identity]
+        BANKR[Bankr LLM Gateway\nInference Payments]
+        LOCUS[Locus\nSpending Control]
+        ARKHAI[Arkhai\nEscrow Extensions]
+        FILECOIN[Filecoin\nPermanent Storage]
+    end
+
+    subgraph HUMANS["👥 Human Actors"]
+        CORE[Core Maintainers]
+        DEVS[Contributor Developers]
+        BOARD[Board Trustees]
+        USERS[DPI Users & Projects]
+    end
+
+    %% Agent relationships
+    MA --> MAINT
+    MA --> CTX
+    MA --> TASKS
+    MA --> RA
+    CA --> NEWS
+    CA --> CONTRIB
+    CA --> REFERRAL
+    SA --> UX
+    TA --> ESCROW
+    TA --> REBAL
+    TA --> SPEND
+    RA --> BADGES
+
+    %% Revenue flows
+    USERS -->|"tip"| TIPS
+    USERS -->|"bribe for priority"| BRIBES
+    USERS -->|"streaming payment"| STREAM
+    NEWS -->|"referral leads"| REFERRAL
+    TIPS --> TREASURY
+    BRIBES --> ESCROW
+    STREAM --> TREASURY
+    REFERRAL --> TREASURY
+
+    %% Treasury flows
+    TREASURY -->|"operational costs"| AGENTS
+    TREASURY -->|"infra costs"| MAINT
+    TREASURY -->|"security audits"| MAINT
+    TREASURY -->|"optional payout"| CORE
+    TREASURY -->|"optional payout"| BOARD
+    MULTI -->|"approve > threshold"| TREASURY
+    REBAL --> UNISWAP
+    SPEND --> LOCUS
+    ESCROW --> ARKHAI
+
+    %% Identity flows
+    AID --> MA
+    AID --> CA
+    AID --> SA
+    AID --> TA
+    CREP --> DEVS
+    BADGES --> DEVS
+    SELFID --> AID
+
+    %% Human oversight
+    CORE -->|"review & approve"| MA
+    CORE -->|"train & oversee"| RA
+    BOARD -->|"governance"| MULTI
+    DEVS -->|"contribute"| TASKS
+
+    %% Infra
+    BANKR -->|"pay inference"| AGENTS
+    CTX --> FILECOIN
+
+    %% Bribe flow detail
+    BRIBES -->|"1. set price"| MA
+    MA -->|"2. broadcast to top devs"| DEVS
+    DEVS -->|"3. compete to deliver"| MA
+    MA -->|"4. review & ship"| USERS
