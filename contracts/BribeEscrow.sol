@@ -1,533 +1,433 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.26;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @title BribeEscrow - Feature-request escrow with contributor assignment
-/// @notice Depositors lock ETH to fund a feature request. The owner (agent)
-///         assigns a contributor, who marks delivery. The owner reviews and
-///         releases funds to the Treasury. Contributors are rewarded with
-///         on-chain reputation and badges — not direct payment. This preserves
-///         the open-source ethos: prestige is the primary motivator.
-///         A mock yield accrues at ~5% APY while funds sit in escrow.
-///         Disputes are resolved by a 2-of-3 arbitrator multisig.
-contract BribeEscrow is Ownable, ReentrancyGuard {
+/// @title BribeEscrow
+/// @notice Full state-machine escrow: Deposited → Broadcast → Assigned → Delivered → Reviewed → Released (to Treasury).
+///         Includes 2-of-3 arbitration, mock 5 % APY yield, and prompt-injection description sanitisation.
+///
+/// MOCK_YIELD = true – yield is computed as (principal * 5 * secondsHeld) / (100 * 365 days).
+contract BribeEscrow is Ownable, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
     // -------------------------------------------------------------------------
-    // Types
+    // Enums
     // -------------------------------------------------------------------------
 
-    /// @notice Lifecycle states for an escrow entry.
-    enum EscrowState {
-        Deposited,  // 0 – funds locked, awaiting contributor assignment
-        Assigned,   // 1 – contributor assigned, awaiting delivery
-        Delivered,  // 2 – contributor marked delivery complete
-        Reviewed,   // 3 – owner reviewed (intermediate, used during re-assign flows)
-        Released,   // 4 – funds released to contributor
-        Refunded,   // 5 – funds returned to briber
-        Disputed    // 6 – briber disputed delivery, awaiting arbitrators
+    enum EscrowStatus {
+        Deposited,   // 0
+        Broadcast,   // 1
+        Assigned,    // 2
+        Delivered,   // 3
+        Reviewed,    // 4
+        Released,    // 5
+        Disputed,    // 6
+        Refunded     // 7
     }
 
-    /// @notice A single escrow record.
+    // -------------------------------------------------------------------------
+    // Structs
+    // -------------------------------------------------------------------------
+
     struct Escrow {
-        uint256      id;
-        address      briber;
-        address      assignedContributor;
-        uint256      amount;
-        string       featureDescription;
-        uint256      minimumBribe;
-        uint256      deadline;
-        EscrowState  state;
-        uint256      yieldAccrued;
-        uint256      depositTime;
+        uint256       id;
+        address       depositor;
+        address       token;          // address(0) = ETH
+        uint256       amount;
+        uint256       yieldAccrued;   // set on release
+        string        description;    // sanitised on deposit
+        EscrowStatus  status;
+        address       assignedContributor;
+        bool          selfIdVerified;
+        uint256       deliveryDeadline;
+        uint256       createdAt;
+        uint256       deliveredAt;
+    }
+
+    // Dispute vote record per escrow
+    struct DisputeVote {
+        uint8 votesRelease;  // votes for "release to treasury"
+        uint8 votesRefund;   // votes for "refund to depositor"
+        mapping(address => bool) hasVoted;
     }
 
     // -------------------------------------------------------------------------
     // Constants
     // -------------------------------------------------------------------------
 
-    /// @notice Approximate 5% APY expressed as wei-of-yield per wei-of-principal
-    ///         per second.  5e16 / (365.25 * 24 * 3600) ≈ 1.585489599e-9.
-    uint256 public constant YIELD_RATE_PER_SECOND = 158548959918; // scaled by 1e18
+    uint256 public constant MOCK_APY_BPS         = 500;    // 5 %
+    uint256 public constant SECONDS_PER_YEAR     = 365 days;
+    uint256 public constant MAX_DESCRIPTION_BYTES = 500;
+    uint256 public constant MIN_BRIBE_DEFAULT    = 1 ether;
 
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
 
-    /// @notice The libp2p Treasury address. All released escrow funds flow here.
-    address payable public treasury;
+    address public immutable treasury;
 
-    /// @notice Minimum ETH deposit required to create an escrow.
     uint256 public minimumBribe;
 
-    /// @dev Auto-incrementing escrow ID counter. First escrow ID is 1.
-    uint256 private _escrowCounter;
+    uint256 private _nextEscrowId = 1;
 
-    /// @notice All escrows keyed by ID.
     mapping(uint256 => Escrow) public escrows;
 
-    /// @notice The three arbitrators for dispute resolution (2-of-3 multisig).
+    // 2-of-3 arbitrators
     address[3] public arbitrators;
 
-    /// @notice Per-escrow per-arbitrator vote record: escrowId => arbitrator => hasVoted.
-    mapping(uint256 => mapping(address => bool)) public disputeVotes;
-
-    /// @notice Number of votes to release funds to treasury for each disputed escrow.
-    mapping(uint256 => uint256) public disputeVotesForRelease;
-
-    /// @notice Number of votes to refund the briber for each disputed escrow.
-    mapping(uint256 => uint256) public disputeVotesForRefund;
-
-    /// @dev Ordered list of active (non-terminal) escrow IDs.
-    uint256[] private _activeEscrowIds;
-    mapping(uint256 => uint256) private _activeIndex; // escrowId => index in _activeEscrowIds
+    mapping(uint256 => DisputeVote) private _disputeVotes;
 
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
 
-    event EscrowCreated(
+    event EscrowDeposited(
         uint256 indexed escrowId,
-        address indexed briber,
+        address indexed depositor,
+        address token,
         uint256 amount,
-        string  featureDescription,
-        uint256 deadline
+        string  description
     );
-    event ContributorAssigned(uint256 indexed escrowId, address indexed contributor);
-    event DeliveryMarked(uint256 indexed escrowId, address indexed contributor);
-    /// @dev Funds always flow to Treasury, contributor is credited for reputation only.
-    event EscrowReleased(uint256 indexed escrowId, address indexed treasury, uint256 amount, address indexed contributor);
-    event EscrowRefunded(uint256 indexed escrowId, address indexed briber, uint256 amount);
-    event DisputeRaised(uint256 indexed escrowId, address indexed briber);
-    event DisputeVoteCast(uint256 indexed escrowId, address indexed arbitrator, bool releaseToTreasury);
-    event DisputeResolved(uint256 indexed escrowId, bool releasedToTreasury);
-    event StateChanged(uint256 indexed escrowId, EscrowState oldState, EscrowState newState);
-    event MinimumBribeUpdated(uint256 newMinimum);
-    event ArbitratorsUpdated(address[3] newArbitrators);
-    event TreasuryUpdated(address indexed newTreasury);
-
-    // -------------------------------------------------------------------------
-    // Errors
-    // -------------------------------------------------------------------------
-
-    error BelowMinimumBribe(uint256 sent, uint256 minimum);
-    error EscrowNotFound(uint256 escrowId);
-    error InvalidStateTransition(uint256 escrowId, EscrowState current, EscrowState required);
-    error NotAssignedContributor(uint256 escrowId, address caller);
-    error NotBriber(uint256 escrowId, address caller);
-    error NotAnArbitrator(address caller);
-    error AlreadyVoted(uint256 escrowId, address arbitrator);
-    error VotingNotOpen(uint256 escrowId);
-    error TransferFailed(address to, uint256 amount);
-    error ZeroAddress();
-    error DeadlinePassed(uint256 escrowId);
-    error DescriptionTooLong();
-    error InvalidCharacter();
+    event TaskBroadcast(uint256 indexed escrowId);
+    event ContributorAssigned(
+        uint256 indexed escrowId,
+        address indexed contributor,
+        bool selfIdVerified
+    );
+    event TaskDelivered(uint256 indexed escrowId, address indexed contributor, uint256 deliveredAt);
+    event FundsReleasedToTreasury(
+        uint256 indexed escrowId,
+        address indexed treasury,
+        uint256 principal,
+        uint256 yieldAccrued
+    );
+    event DisputeRaised(uint256 indexed escrowId, address indexed raisedBy);
+    event ArbitratorVoted(
+        uint256 indexed escrowId,
+        address indexed arbitrator,
+        bool    releaseToTreasury
+    );
+    event DisputeResolved(
+        uint256 indexed escrowId,
+        bool    releasedToTreasury
+    );
 
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
-    /// @param initialOwner    Contract owner (acts as agent/admin).
-    /// @param _treasury       Treasury address — all released funds flow here.
-    /// @param _minimumBribe   Initial minimum bribe in wei.
-    /// @param _arbitrators    The three arbitrator addresses for 2-of-3 dispute resolution.
+    /// @param _treasury     Address that receives released funds.
+    /// @param _minimumBribe Minimum bribe amount (use MIN_BRIBE_DEFAULT = 1 ETH in prod).
+    /// @param arb0          First arbitrator address.
+    /// @param arb1          Second arbitrator address.
+    /// @param arb2          Third arbitrator address.
     constructor(
-        address initialOwner,
-        address payable _treasury,
+        address _treasury,
         uint256 _minimumBribe,
-        address[3] memory _arbitrators
-    ) Ownable(initialOwner) {
-        if (_treasury == address(0)) revert ZeroAddress();
+        address arb0,
+        address arb1,
+        address arb2
+    ) Ownable(msg.sender) {
+        require(_treasury != address(0), "BribeEscrow: zero treasury");
+        require(arb0 != address(0) && arb1 != address(0) && arb2 != address(0), "BribeEscrow: zero arbitrator");
+
         treasury     = _treasury;
-        minimumBribe = _minimumBribe;
-        arbitrators  = _arbitrators;
-        _escrowCounter = 1;
-    }
+        minimumBribe = _minimumBribe == 0 ? MIN_BRIBE_DEFAULT : _minimumBribe;
 
-    /// @notice Update the treasury address.
-    function setTreasury(address payable _treasury) external onlyOwner {
-        if (_treasury == address(0)) revert ZeroAddress();
-        treasury = _treasury;
-        emit TreasuryUpdated(_treasury);
-    }
-
-    /// @notice Replace all three arbitrators atomically.
-    function setArbitrators(address[3] calldata _arbitrators) external onlyOwner {
-        arbitrators = _arbitrators;
-        emit ArbitratorsUpdated(_arbitrators);
+        arbitrators[0] = arb0;
+        arbitrators[1] = arb1;
+        arbitrators[2] = arb2;
     }
 
     // -------------------------------------------------------------------------
-    // External – Depositor
+    // Deposit
     // -------------------------------------------------------------------------
 
-    /// @notice Create a new escrow by depositing ETH for a feature request.
-    /// @param featureDescription  Human-readable description of the requested feature.
-    /// @param deadline            Unix timestamp by which delivery is expected.
-    /// @return escrowId           The ID of the newly created escrow.
-    function createEscrow(string calldata featureDescription, uint256 deadline)
+    /// @notice Deposit ETH or ERC-20 into escrow.
+    /// @param token        Token address (address(0) for ETH).
+    /// @param amount       Amount (ignored for ETH; use msg.value).
+    /// @param description  Task description (sanitised).
+    /// @param deadlineDays Number of days until delivery deadline.
+    function deposit(
+        address        token,
+        uint256        amount,
+        string calldata description,
+        uint256        deadlineDays
+    )
         external
         payable
         nonReentrant
-        returns (uint256 escrowId)
+        whenNotPaused
     {
-        _validateDescription(featureDescription);
+        _validateDescription(description);
 
-        if (msg.value < minimumBribe) {
-            revert BelowMinimumBribe(msg.value, minimumBribe);
-        }
-
-        escrowId = _escrowCounter;
-        unchecked { _escrowCounter++; }
-
-        escrows[escrowId] = Escrow({
-            id:                  escrowId,
-            briber:              msg.sender,
-            assignedContributor: address(0),
-            amount:              msg.value,
-            featureDescription:  featureDescription,
-            minimumBribe:        minimumBribe,
-            deadline:            deadline,
-            state:               EscrowState.Deposited,
-            yieldAccrued:        0,
-            depositTime:         block.timestamp
-        });
-
-        _activeEscrowIds.push(escrowId);
-        _activeIndex[escrowId] = _activeEscrowIds.length - 1;
-
-        emit EscrowCreated(escrowId, msg.sender, msg.value, featureDescription, deadline);
-        emit StateChanged(escrowId, EscrowState.Deposited, EscrowState.Deposited);
-    }
-
-    // -------------------------------------------------------------------------
-    // External – Admin (owner / agent)
-    // -------------------------------------------------------------------------
-
-    /// @notice Update the minimum bribe amount.
-    function setMinimumBribe(uint256 minimum) external onlyOwner {
-        minimumBribe = minimum;
-        emit MinimumBribeUpdated(minimum);
-    }
-
-    /// @notice Assign a contributor to an escrow in Deposited state.
-    /// @param escrowId    The escrow to assign.
-    /// @param contributor The contributor's address.
-    function assignContributor(uint256 escrowId, address contributor)
-        external
-        onlyOwner
-    {
-        Escrow storage e = _requireEscrow(escrowId);
-        if (e.state != EscrowState.Deposited) {
-            revert InvalidStateTransition(escrowId, e.state, EscrowState.Deposited);
-        }
-        if (contributor == address(0)) revert ZeroAddress();
-
-        EscrowState old = e.state;
-        e.assignedContributor = contributor;
-        e.state = EscrowState.Assigned;
-
-        emit ContributorAssigned(escrowId, contributor);
-        emit StateChanged(escrowId, old, EscrowState.Assigned);
-    }
-
-    /// @notice Re-assign a contributor (e.g. after a failed delivery review).
-    /// @dev    Moves escrow back to Assigned with the new contributor.
-    function reassignContributor(uint256 escrowId, address newContributor)
-        external
-        onlyOwner
-    {
-        Escrow storage e = _requireEscrow(escrowId);
-        if (
-            e.state != EscrowState.Assigned &&
-            e.state != EscrowState.Delivered &&
-            e.state != EscrowState.Reviewed
-        ) {
-            revert InvalidStateTransition(escrowId, e.state, EscrowState.Assigned);
-        }
-        if (newContributor == address(0)) revert ZeroAddress();
-
-        EscrowState old = e.state;
-        e.assignedContributor = newContributor;
-        e.state = EscrowState.Assigned;
-
-        emit ContributorAssigned(escrowId, newContributor);
-        emit StateChanged(escrowId, old, EscrowState.Assigned);
-    }
-
-    /// @notice Review a delivered escrow and either release funds or reassign.
-    /// @param escrowId  The escrow to review.
-    /// @param approved  If true, funds are released to the contributor.
-    ///                  If false, escrow reverts to Reviewed state for reassignment.
-    function reviewAndRelease(uint256 escrowId, bool approved)
-        external
-        nonReentrant
-        onlyOwner
-    {
-        Escrow storage e = _requireEscrow(escrowId);
-        if (e.state != EscrowState.Delivered) {
-            revert InvalidStateTransition(escrowId, e.state, EscrowState.Delivered);
-        }
-
-        if (approved) {
-            EscrowState old = e.state;
-            address contributor = e.assignedContributor;
-            e.state = EscrowState.Released;
-            _removeFromActive(escrowId);
-
-            uint256 yieldAmount = getYieldAccrued(escrowId);
-            e.yieldAccrued = yieldAmount;
-            uint256 payout = e.amount + yieldAmount;
-
-            emit StateChanged(escrowId, old, EscrowState.Released);
-            // Funds go to Treasury; contributor is credited on-chain for reputation
-            emit EscrowReleased(escrowId, treasury, payout, contributor);
-
-            _sendEth(treasury, payout);
+        uint256 actualAmount;
+        if (token == address(0)) {
+            require(msg.value >= minimumBribe, "BribeEscrow: below minimumBribe");
+            actualAmount = msg.value;
         } else {
-            EscrowState old = e.state;
-            e.state = EscrowState.Reviewed;
-            emit StateChanged(escrowId, old, EscrowState.Reviewed);
-        }
-    }
-
-    /// @notice Agent delivers directly, releasing funds to the owner/treasury.
-    /// @dev    Can be called on any non-terminal escrow. Sends funds to the
-    ///         contract owner (the agent / treasury operator).
-    function agentDeliver(uint256 escrowId)
-        external
-        nonReentrant
-        onlyOwner
-    {
-        Escrow storage e = _requireEscrow(escrowId);
-        if (
-            e.state == EscrowState.Released ||
-            e.state == EscrowState.Refunded
-        ) {
-            revert InvalidStateTransition(escrowId, e.state, EscrowState.Assigned);
+            require(amount >= minimumBribe, "BribeEscrow: below minimumBribe");
+            require(msg.value == 0, "BribeEscrow: ETH sent with token deposit");
+            actualAmount = amount;
         }
 
-        EscrowState old = e.state;
-        e.state = EscrowState.Released;
-        _removeFromActive(escrowId);
+        uint256 id = _nextEscrowId++;
 
-        uint256 yieldAmount = getYieldAccrued(escrowId);
-        e.yieldAccrued = yieldAmount;
-        uint256 payout = e.amount + yieldAmount;
+        Escrow storage e = escrows[id];
+        e.id                   = id;
+        e.depositor            = msg.sender;
+        e.token                = token;
+        e.amount               = actualAmount;
+        e.description          = description;
+        e.status               = EscrowStatus.Deposited;
+        e.deliveryDeadline     = block.timestamp + (deadlineDays * 1 days);
+        e.createdAt            = block.timestamp;
 
-        emit StateChanged(escrowId, old, EscrowState.Released);
-        emit EscrowReleased(escrowId, treasury, payout, address(0)); // agent delivery, no contributor
+        if (token != address(0)) {
+            IERC20(token).safeTransferFrom(msg.sender, address(this), actualAmount);
+        }
 
-        _sendEth(treasury, payout);
+        emit EscrowDeposited(id, msg.sender, token, actualAmount, description);
     }
 
     // -------------------------------------------------------------------------
-    // External – Contributor
+    // State transitions (owner-gated)
     // -------------------------------------------------------------------------
 
-    /// @notice Mark an escrow as delivered. Only the assigned contributor may call.
-    /// @param escrowId  The escrow to mark as delivered.
+    function broadcastTask(uint256 escrowId) external onlyOwner {
+        Escrow storage e = _getEscrow(escrowId);
+        require(e.status == EscrowStatus.Deposited, "BribeEscrow: not Deposited");
+        e.status = EscrowStatus.Broadcast;
+        emit TaskBroadcast(escrowId);
+    }
+
+    function assignContributor(
+        uint256 escrowId,
+        address contributor,
+        bool    selfIdVerified
+    ) external onlyOwner {
+        require(contributor != address(0), "BribeEscrow: zero contributor");
+        Escrow storage e = _getEscrow(escrowId);
+        require(e.status == EscrowStatus.Broadcast, "BribeEscrow: not Broadcast");
+        e.status               = EscrowStatus.Assigned;
+        e.assignedContributor  = contributor;
+        e.selfIdVerified       = selfIdVerified;
+        emit ContributorAssigned(escrowId, contributor, selfIdVerified);
+    }
+
+    // -------------------------------------------------------------------------
+    // Contributor delivery
+    // -------------------------------------------------------------------------
+
     function markDelivered(uint256 escrowId) external {
-        Escrow storage e = _requireEscrow(escrowId);
-        if (e.assignedContributor != msg.sender) {
-            revert NotAssignedContributor(escrowId, msg.sender);
-        }
-        if (e.state != EscrowState.Assigned) {
-            revert InvalidStateTransition(escrowId, e.state, EscrowState.Assigned);
-        }
-
-        EscrowState old = e.state;
-        e.state = EscrowState.Delivered;
-
-        emit DeliveryMarked(escrowId, msg.sender);
-        emit StateChanged(escrowId, old, EscrowState.Delivered);
+        Escrow storage e = _getEscrow(escrowId);
+        require(e.status == EscrowStatus.Assigned, "BribeEscrow: not Assigned");
+        require(msg.sender == e.assignedContributor, "BribeEscrow: not contributor");
+        e.status      = EscrowStatus.Delivered;
+        e.deliveredAt = block.timestamp;
+        emit TaskDelivered(escrowId, msg.sender, block.timestamp);
     }
 
     // -------------------------------------------------------------------------
-    // External – Briber
+    // Review & release (funds go to TREASURY)
     // -------------------------------------------------------------------------
 
-    /// @notice Dispute a delivery. Only the original briber may call.
-    /// @dev    Moves escrow from Delivered to Disputed. Arbitrators then vote to resolve.
-    function disputeDelivery(uint256 escrowId) external {
-        Escrow storage e = _requireEscrow(escrowId);
-        if (e.briber != msg.sender) revert NotBriber(escrowId, msg.sender);
-        if (e.state != EscrowState.Delivered) {
-            revert InvalidStateTransition(escrowId, e.state, EscrowState.Delivered);
-        }
+    function reviewAndRelease(uint256 escrowId) external onlyOwner nonReentrant whenNotPaused {
+        Escrow storage e = _getEscrow(escrowId);
+        require(e.status == EscrowStatus.Delivered, "BribeEscrow: not Delivered");
+        e.status = EscrowStatus.Reviewed;
+        _releaseFundsToTreasury(e);
+    }
 
-        EscrowState old = e.state;
-        e.state = EscrowState.Disputed;
+    // -------------------------------------------------------------------------
+    // Dispute & arbitration
+    // -------------------------------------------------------------------------
 
+    /// @notice Raise a dispute (owner only to prevent spam).
+    function raiseDispute(uint256 escrowId) external onlyOwner {
+        Escrow storage e = _getEscrow(escrowId);
+        require(
+            e.status == EscrowStatus.Assigned ||
+            e.status == EscrowStatus.Delivered ||
+            e.status == EscrowStatus.Reviewed,
+            "BribeEscrow: cannot dispute at this stage"
+        );
+        e.status = EscrowStatus.Disputed;
         emit DisputeRaised(escrowId, msg.sender);
-        emit StateChanged(escrowId, old, EscrowState.Disputed);
     }
 
-    // -------------------------------------------------------------------------
-    // External – Arbitrators (2-of-3 multisig)
-    // -------------------------------------------------------------------------
+    /// @notice Arbitrator casts a vote on a disputed escrow.
+    /// @param escrowId          The escrow under dispute.
+    /// @param releaseToTreasury True = send funds to treasury; false = refund depositor.
+    function voteOnDispute(uint256 escrowId, bool releaseToTreasury) external nonReentrant whenNotPaused {
+        Escrow storage e = _getEscrow(escrowId);
+        require(e.status == EscrowStatus.Disputed, "BribeEscrow: not Disputed");
 
-    /// @notice Cast a vote to resolve a disputed escrow.
-    /// @dev    Callable only by one of the three registered arbitrators.
-    ///         When two arbitrators agree on the same outcome the resolution executes.
-    /// @param escrowId          The disputed escrow.
-    /// @param releaseToTreasury If true, vote to release funds to treasury (contributor wins).
-    ///                          If false, vote to refund the briber.
-    function voteOnDispute(uint256 escrowId, bool releaseToTreasury)
-        external
-        nonReentrant
-    {
-        // Verify caller is one of the three arbitrators
         bool isArbitrator = false;
         for (uint256 i = 0; i < 3; i++) {
-            if (arbitrators[i] == msg.sender) {
-                isArbitrator = true;
-                break;
-            }
+            if (arbitrators[i] == msg.sender) { isArbitrator = true; break; }
         }
-        if (!isArbitrator) revert NotAnArbitrator(msg.sender);
+        require(isArbitrator, "BribeEscrow: not arbitrator");
 
-        Escrow storage e = _requireEscrow(escrowId);
-        if (e.state != EscrowState.Disputed) revert VotingNotOpen(escrowId);
+        DisputeVote storage dv = _disputeVotes[escrowId];
+        require(!dv.hasVoted[msg.sender], "BribeEscrow: already voted");
 
-        if (disputeVotes[escrowId][msg.sender]) revert AlreadyVoted(escrowId, msg.sender);
-
-        // Record the vote
-        disputeVotes[escrowId][msg.sender] = true;
-
-        emit DisputeVoteCast(escrowId, msg.sender, releaseToTreasury);
+        dv.hasVoted[msg.sender] = true;
 
         if (releaseToTreasury) {
-            disputeVotesForRelease[escrowId] += 1;
+            dv.votesRelease += 1;
         } else {
-            disputeVotesForRefund[escrowId] += 1;
+            dv.votesRefund  += 1;
         }
 
-        // Check if quorum (2 votes) reached for either outcome
-        if (disputeVotesForRelease[escrowId] >= 2) {
-            _resolveDisputeRelease(escrowId, e);
-        } else if (disputeVotesForRefund[escrowId] >= 2) {
-            _resolveDisputeRefund(escrowId, e);
+        emit ArbitratorVoted(escrowId, msg.sender, releaseToTreasury);
+
+        // Execute on first reaching 2 matching votes (2-of-3)
+        if (dv.votesRelease >= 2) {
+            e.status = EscrowStatus.Reviewed;
+            _releaseFundsToTreasury(e);
+            emit DisputeResolved(escrowId, true);
+        } else if (dv.votesRefund >= 2) {
+            e.status = EscrowStatus.Refunded;
+            _refundDepositor(e);
+            emit DisputeResolved(escrowId, false);
         }
     }
 
     // -------------------------------------------------------------------------
-    // Public – Views
+    // Internal – fund movement
     // -------------------------------------------------------------------------
 
-    /// @notice Calculate the mock yield accrued for an escrow since deposit.
-    /// @dev    yield = principal * YIELD_RATE_PER_SECOND * elapsed / 1e18
-    ///         For terminal escrows (Released/Refunded) returns the stored value.
-    function getYieldAccrued(uint256 escrowId) public view returns (uint256) {
-        Escrow storage e = _requireEscrowView(escrowId);
+    function _releaseFundsToTreasury(Escrow storage e) internal {
+        uint256 principal = e.amount;
+        uint256 yield     = _calcMockYield(principal, e.createdAt);
+        e.yieldAccrued    = yield;
+        uint256 total     = principal + yield;
+        e.status          = EscrowStatus.Released;
 
-        // For terminal states, return the stored accrued amount
-        if (
-            e.state == EscrowState.Released ||
-            e.state == EscrowState.Refunded
-        ) {
-            return e.yieldAccrued;
+        if (e.token == address(0)) {
+            // Principal was held in contract; send to treasury
+            (bool ok, ) = treasury.call{value: total > address(this).balance ? address(this).balance : total}("");
+            require(ok, "BribeEscrow: ETH release failed");
+        } else {
+            // ERC-20 principal; yield is conceptual in mock mode
+            IERC20(e.token).safeTransfer(treasury, principal);
         }
 
-        uint256 elapsed = block.timestamp - e.depositTime;
-        // principal * rate * elapsed / 1e18  (rate is scaled by 1e18)
-        return (e.amount * YIELD_RATE_PER_SECOND * elapsed) / 1e18;
+        emit FundsReleasedToTreasury(e.id, treasury, principal, yield);
     }
 
-    /// @notice Retrieve a full escrow record.
-    function getEscrow(uint256 escrowId) external view returns (Escrow memory) {
-        return _requireEscrowView(escrowId);
+    function _refundDepositor(Escrow storage e) internal {
+        uint256 principal = e.amount;
+        if (e.token == address(0)) {
+            (bool ok, ) = e.depositor.call{value: principal}("");
+            require(ok, "BribeEscrow: ETH refund failed");
+        } else {
+            IERC20(e.token).safeTransfer(e.depositor, principal);
+        }
     }
 
-    /// @notice Returns all currently active (non-terminal) escrow IDs.
-    function getActiveEscrows() external view returns (uint256[] memory) {
-        return _activeEscrowIds;
+    // -------------------------------------------------------------------------
+    // Mock yield (MOCK_YIELD = true)
+    // -------------------------------------------------------------------------
+
+    /// @notice 5 % APY simple yield since deposit.
+    function _calcMockYield(uint256 principal, uint256 depositedAt) internal view returns (uint256) {
+        uint256 elapsed = block.timestamp > depositedAt ? block.timestamp - depositedAt : 0;
+        return (principal * MOCK_APY_BPS * elapsed) / (10_000 * SECONDS_PER_YEAR);
     }
+
+    // -------------------------------------------------------------------------
+    // Description sanitisation
+    // -------------------------------------------------------------------------
+
+    /// @dev Rejects descriptions longer than MAX_DESCRIPTION_BYTES or containing null bytes.
+    function _validateDescription(string calldata desc) internal pure {
+        bytes memory b = bytes(desc);
+        require(b.length > 0,                          "BribeEscrow: empty description");
+        require(b.length <= MAX_DESCRIPTION_BYTES,     "BribeEscrow: description too long");
+        for (uint256 i = 0; i < b.length; i++) {
+            require(b[i] != 0x00, "BribeEscrow: null byte in description");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Owner administration
+    // -------------------------------------------------------------------------
+
+    function setMinimumBribe(uint256 amount) external onlyOwner {
+        require(amount > 0, "BribeEscrow: zero minimum");
+        minimumBribe = amount;
+    }
+
+    function updateArbitrator(uint8 index, address newArbitrator) external onlyOwner {
+        require(index < 3, "BribeEscrow: invalid index");
+        require(newArbitrator != address(0), "BribeEscrow: zero address");
+        arbitrators[index] = newArbitrator;
+    }
+
+    function pause()   external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
 
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    /// @dev Resolves a dispute in favour of the treasury/contributor (2 release votes reached).
-    function _resolveDisputeRelease(uint256 escrowId, Escrow storage e) internal {
-        EscrowState old = e.state;
-        _removeFromActive(escrowId);
-
-        uint256 yieldAmount = getYieldAccrued(escrowId);
-        e.yieldAccrued = yieldAmount;
-        uint256 payout = e.amount + yieldAmount;
-
-        e.state = EscrowState.Released;
-        emit StateChanged(escrowId, old, EscrowState.Released);
-        emit EscrowReleased(escrowId, treasury, payout, e.assignedContributor);
-        emit DisputeResolved(escrowId, true);
-
-        _sendEth(treasury, payout);
+    function _getEscrow(uint256 id) internal view returns (Escrow storage) {
+        require(id > 0 && id < _nextEscrowId, "BribeEscrow: escrow does not exist");
+        return escrows[id];
     }
 
-    /// @dev Resolves a dispute in favour of the briber (2 refund votes reached).
-    function _resolveDisputeRefund(uint256 escrowId, Escrow storage e) internal {
-        EscrowState old = e.state;
-        _removeFromActive(escrowId);
+    // -------------------------------------------------------------------------
+    // View helpers
+    // -------------------------------------------------------------------------
 
-        uint256 yieldAmount = getYieldAccrued(escrowId);
-        e.yieldAccrued = yieldAmount;
-        uint256 payout = e.amount + yieldAmount;
-
-        e.state = EscrowState.Refunded;
-        emit StateChanged(escrowId, old, EscrowState.Refunded);
-        emit EscrowRefunded(escrowId, e.briber, payout);
-        emit DisputeResolved(escrowId, false);
-
-        _sendEth(payable(e.briber), payout);
+    function getEscrow(uint256 id) external view returns (
+        uint256 escrowId,
+        address depositor,
+        address token,
+        uint256 amount,
+        uint256 yieldAccrued,
+        EscrowStatus status,
+        address assignedContributor,
+        bool    selfIdVerified,
+        uint256 deliveryDeadline,
+        uint256 createdAt,
+        uint256 deliveredAt,
+        string  memory description
+    ) {
+        Escrow storage e = _getEscrow(id);
+        return (
+            e.id,
+            e.depositor,
+            e.token,
+            e.amount,
+            e.yieldAccrued,
+            e.status,
+            e.assignedContributor,
+            e.selfIdVerified,
+            e.deliveryDeadline,
+            e.createdAt,
+            e.deliveredAt,
+            e.description
+        );
     }
 
-    /// @dev Validate a feature description for length and null-byte injection.
-    function _validateDescription(string calldata desc) internal pure {
-        bytes calldata b = bytes(desc);
-        if (b.length > 500) revert DescriptionTooLong();
-        for (uint256 i = 0; i < b.length; i++) {
-            if (b[i] == 0x00) revert InvalidCharacter();
-        }
+    function totalEscrows() external view returns (uint256) { return _nextEscrowId - 1; }
+
+    function estimatedYield(uint256 escrowId) external view returns (uint256) {
+        Escrow storage e = _getEscrow(escrowId);
+        return _calcMockYield(e.amount, e.createdAt);
     }
 
-    /// @dev Returns a storage reference to an escrow, reverting if ID 0 or
-    ///      the escrow has never been initialised (briber == address(0)).
-    function _requireEscrow(uint256 escrowId)
-        internal
-        view
-        returns (Escrow storage e)
-    {
-        e = escrows[escrowId];
-        if (e.briber == address(0)) revert EscrowNotFound(escrowId);
-    }
+    // -------------------------------------------------------------------------
+    // Receive
+    // -------------------------------------------------------------------------
 
-    /// @dev Pure-view variant (no storage mutation path required).
-    function _requireEscrowView(uint256 escrowId)
-        internal
-        view
-        returns (Escrow storage e)
-    {
-        e = escrows[escrowId];
-        if (e.briber == address(0)) revert EscrowNotFound(escrowId);
-    }
-
-    /// @dev Removes an escrow ID from the active list (swap-and-pop).
-    function _removeFromActive(uint256 escrowId) internal {
-        uint256 idx  = _activeIndex[escrowId];
-        uint256 last = _activeEscrowIds[_activeEscrowIds.length - 1];
-
-        _activeEscrowIds[idx] = last;
-        _activeIndex[last]    = idx;
-
-        _activeEscrowIds.pop();
-        delete _activeIndex[escrowId];
-    }
-
-    /// @dev Sends ETH, reverting on failure.
-    function _sendEth(address payable to, uint256 amount) internal {
-        (bool success, ) = to.call{value: amount}("");
-        if (!success) revert TransferFailed(to, amount);
-    }
+    receive() external payable {}
 }

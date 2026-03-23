@@ -5,6 +5,8 @@ import ContributorBoard from './components/ContributorBoard'
 import TippingWidget from './components/TippingWidget'
 import TaskBoard from './components/TaskBoard'
 import ActivityFeed from './components/ActivityFeed'
+import { StreamingDashboard } from './components/StreamingDashboard'
+import { BribeFlow } from './components/BribeFlow'
 import {
   mockAgents,
   mockTreasury,
@@ -15,14 +17,16 @@ import {
 } from './mockData'
 import type { AgentStatus, TreasuryData, ActivityEvent } from './types'
 
-type Tab = 'overview' | 'agents' | 'treasury' | 'contributors' | 'tasks' | 'activity'
+type Tab = 'overview' | 'agents' | 'treasury' | 'streaming' | 'contributors' | 'tasks' | 'bribes' | 'activity'
 
 const NAV_ITEMS: { id: Tab; icon: string; label: string }[] = [
   { id: 'overview',     icon: '📊', label: 'Overview'     },
   { id: 'agents',       icon: '🤖', label: 'Agents'       },
   { id: 'treasury',     icon: '💰', label: 'Treasury'     },
+  { id: 'streaming',    icon: '🌊', label: 'Streaming'    },
   { id: 'contributors', icon: '👥', label: 'Contributors' },
   { id: 'tasks',        icon: '📋', label: 'Tasks'        },
+  { id: 'bribes',       icon: '🎯', label: 'Bribes'       },
   { id: 'activity',     icon: '⚡', label: 'Activity'     },
 ]
 
@@ -322,9 +326,19 @@ export default function App() {
             </div>
           )}
 
+          {/* STREAMING */}
+          {tab === 'streaming' && (
+            <StreamingDashboard />
+          )}
+
           {/* TASKS */}
           {tab === 'tasks' && (
             <TaskBoard tasks={mockTasks} />
+          )}
+
+          {/* BRIBES */}
+          {tab === 'bribes' && (
+            <BribeFlow />
           )}
 
           {/* ACTIVITY */}

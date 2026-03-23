@@ -1,53 +1,63 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.26;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @title StreamingAgreement - ETH payment-streaming with SLA enforcement
-/// @notice Payers deposit ETH and funds accrue to the recipient at a fixed
-///         rate per second. The payer may top up at any time. SLA breaches
-///         can be reported by anyone and confirmed by the owner, who may then
-///         pause the stream. When a stream is paused the amount accrued up to
-///         the pause point is snapshotted and remains claimable. Cancellation
-///         requires a notice period before the remaining balance is refunded.
-contract StreamingAgreement is Ownable, ReentrancyGuard {
+/// @title StreamingAgreement
+/// @notice Protocol Guild-style per-second payment streaming with SLA tracking.
+///         Only the treasury can claim streamed funds.
+///         ETH and whitelisted ERC-20 tokens are supported.
+contract StreamingAgreement is Ownable, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
     // -------------------------------------------------------------------------
-    // Types
+    // Defaults
     // -------------------------------------------------------------------------
 
-    /// @notice A payment-streaming agreement between a payer and a recipient.
+    uint256 public constant DEFAULT_SLA_MAX_DOWNTIME_HOURS  = 24;
+    uint256 public constant DEFAULT_SLA_MAX_RESPONSE_HOURS  = 72;
+    uint256 public constant DEFAULT_NOTICE_PERIOD_DAYS      = 30;
+    uint256 public constant UPFRONT_DEPOSIT_DAYS            = 30;
+
+    // -------------------------------------------------------------------------
+    // Structs
+    // -------------------------------------------------------------------------
+
     struct Agreement {
-        uint256         id;
-        address         payer;
-        address payable recipient;
-        uint256         ratePerSecond;
-        uint256         startTime;
-        uint256         lastClaimedTime;
-        uint256         totalDeposited;
-        uint256         totalClaimed;
-        bool            active;
-        uint256         slaMaxDowntimeHours;
-        uint256         slaMaxResponseTimeHours;
-        bool            paused;
-        uint256         cancellationNoticePeriod; // seconds
-        uint256         cancellationRequestedAt;  // 0 if not requested
-        string          lastBreachDescription;
-        uint256         accruedAtPause;           // snapshot of claimable amount at pause time
+        uint256 id;
+        address payer;
+        address token;            // address(0) = ETH
+        uint256 ratePerSecond;
+        uint256 startTime;
+        uint256 lastClaimedTime;
+        uint256 endTime;          // 0 = indefinite
+        uint256 totalStreamed;    // lifetime accrued (informational)
+        uint256 totalClaimed;
+        bool    paused;
+        uint256 accruedAtPause;  // snapshot when paused
+        uint256 slaMaxDowntimeHours;
+        uint256 slaMaxResponseHours;
+        uint256 noticePeriodDays;
+        uint256 cancellationRequestedAt; // 0 = not requested
+        uint256 depositBalance;  // remaining unfunded deposit held in contract
     }
 
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
 
-    uint256 private _agreementCounter;
+    address public immutable treasury;
 
-    /// @notice All agreements keyed by ID.
+    uint256 private _nextAgreementId = 1;
+
     mapping(uint256 => Agreement) public agreements;
 
-    /// @dev Ordered list of active agreement IDs.
-    uint256[] private _activeAgreementIds;
-    mapping(uint256 => uint256) private _activeIndex; // agreementId => index
+    // Token whitelist; address(0) = ETH always accepted
+    mapping(address => bool) public acceptedTokens;
 
     // -------------------------------------------------------------------------
     // Events
@@ -56,323 +66,289 @@ contract StreamingAgreement is Ownable, ReentrancyGuard {
     event AgreementCreated(
         uint256 indexed agreementId,
         address indexed payer,
-        address indexed recipient,
+        address token,
         uint256 ratePerSecond,
-        uint256 initialDeposit
+        uint256 startTime,
+        uint256 endTime
     );
-    event FundsToppedUp(uint256 indexed agreementId, address indexed by, uint256 amount);
-    event FundsClaimed(uint256 indexed agreementId, address indexed recipient, uint256 amount);
-    event SlaBreachReported(uint256 indexed agreementId, address indexed reporter, string description);
-    event SlaBreachVerified(uint256 indexed agreementId, bool confirmed);
-    event StreamPaused(uint256 indexed agreementId);
-    event StreamResumed(uint256 indexed agreementId);
-    event CancellationRequested(uint256 indexed agreementId, address indexed payer, uint256 executeAfter);
-    event AgreementCancelled(uint256 indexed agreementId, uint256 refunded);
-
-    // -------------------------------------------------------------------------
-    // Errors
-    // -------------------------------------------------------------------------
-
-    error AgreementNotFound(uint256 agreementId);
-    error NotPayer(uint256 agreementId, address caller);
-    error NotRecipient(uint256 agreementId, address caller);
-    error AgreementNotActive(uint256 agreementId);
-    error AgreementAlreadyPaused(uint256 agreementId);
-    error AgreementNotPaused(uint256 agreementId);
-    error NoCancellationRequested(uint256 agreementId);
-    error NoticePeriodNotElapsed(uint256 agreementId, uint256 executeAfter);
-    error NoFundsToTop(uint256 agreementId);
-    error ZeroDeposit();
-    error ZeroRate();
-    error ZeroAddress();
-    error TransferFailed(address to, uint256 amount);
-    error NothingToClaim(uint256 agreementId);
+    event StreamClaimed(
+        uint256 indexed agreementId,
+        address indexed claimedTo,
+        uint256 amount
+    );
+    event SLABreachReported(
+        uint256 indexed agreementId,
+        address indexed reporter,
+        string  reason
+    );
+    event StreamPaused(uint256 indexed agreementId, uint256 accruedAtPause);
+    event StreamResumed(uint256 indexed agreementId, uint256 resumedAt);
+    event CancellationRequested(uint256 indexed agreementId, uint256 requestedAt);
+    event AgreementCancelled(
+        uint256 indexed agreementId,
+        address indexed payer,
+        uint256 refundAmount
+    );
+    event AcceptedTokenSet(address indexed token, bool accepted);
 
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
-    /// @param initialOwner Contract owner (arbitrates SLA breaches, pauses streams).
-    constructor(address initialOwner) Ownable(initialOwner) {
-        _agreementCounter = 1;
+    /// @param _treasury  Address that receives claimed stream funds.
+    constructor(address _treasury) Ownable(msg.sender) {
+        require(_treasury != address(0), "StreamingAgreement: zero treasury");
+        treasury = _treasury;
     }
 
     // -------------------------------------------------------------------------
-    // External – Payer
+    // Token whitelist management
     // -------------------------------------------------------------------------
 
-    /// @notice Create a new streaming agreement.
-    /// @param recipient                  Address that receives streamed ETH.
-    /// @param ratePerSecond              ETH (in wei) released per second.
-    /// @param slaMaxDowntimeHours        Maximum allowed downtime in hours.
-    /// @param slaMaxResponseTimeHours    Maximum allowed response time in hours.
-    /// @param cancellationNoticePeriod   Seconds the payer must wait after requesting
-    ///                                   cancellation before funds can be refunded.
-    /// @return agreementId               ID of the created agreement.
+    function setAcceptedToken(address token, bool accepted) external onlyOwner {
+        require(token != address(0), "StreamingAgreement: zero address");
+        acceptedTokens[token] = accepted;
+        emit AcceptedTokenSet(token, accepted);
+    }
+
+    // -------------------------------------------------------------------------
+    // Create agreement
+    // -------------------------------------------------------------------------
+
+    /// @notice Create a streaming agreement.  Payer must supply an upfront deposit
+    ///         covering 30 days of streaming.
+    /// @param token           Payment token (address(0) for ETH).
+    /// @param ratePerSecond   Tokens streamed per second.
+    /// @param endTime         Unix timestamp when stream ends (0 = indefinite).
+    /// @param slaMaxDowntime  SLA maximum downtime in hours (0 = use default 24 h).
+    /// @param slaMaxResponse  SLA maximum response time in hours (0 = use default 72 h).
+    /// @param noticePeriod    Cancellation notice period in days (0 = use default 30 d).
     function createAgreement(
-        address payable recipient,
+        address token,
         uint256 ratePerSecond,
-        uint256 slaMaxDowntimeHours,
-        uint256 slaMaxResponseTimeHours,
-        uint256 cancellationNoticePeriod
+        uint256 endTime,
+        uint256 slaMaxDowntime,
+        uint256 slaMaxResponse,
+        uint256 noticePeriod
     )
         external
         payable
         nonReentrant
-        returns (uint256 agreementId)
+        whenNotPaused
     {
-        if (msg.value == 0)           revert ZeroDeposit();
-        if (ratePerSecond == 0)       revert ZeroRate();
-        if (recipient == address(0))  revert ZeroAddress();
-
-        agreementId = _agreementCounter;
-        unchecked { _agreementCounter++; }
-
-        agreements[agreementId] = Agreement({
-            id:                       agreementId,
-            payer:                    msg.sender,
-            recipient:                recipient,
-            ratePerSecond:            ratePerSecond,
-            startTime:                block.timestamp,
-            lastClaimedTime:          block.timestamp,
-            totalDeposited:           msg.value,
-            totalClaimed:             0,
-            active:                   true,
-            slaMaxDowntimeHours:      slaMaxDowntimeHours,
-            slaMaxResponseTimeHours:  slaMaxResponseTimeHours,
-            paused:                   false,
-            cancellationNoticePeriod: cancellationNoticePeriod,
-            cancellationRequestedAt:  0,
-            lastBreachDescription:    "",
-            accruedAtPause:           0
-        });
-
-        _activeAgreementIds.push(agreementId);
-        _activeIndex[agreementId] = _activeAgreementIds.length - 1;
-
-        emit AgreementCreated(agreementId, msg.sender, recipient, ratePerSecond, msg.value);
-    }
-
-    /// @notice Add more ETH to an active agreement's balance.
-    function topUp(uint256 agreementId) external payable nonReentrant {
-        Agreement storage a = _requireActive(agreementId);
-        if (msg.value == 0) revert NoFundsToTop(agreementId);
-
-        a.totalDeposited += msg.value;
-        emit FundsToppedUp(agreementId, msg.sender, msg.value);
-    }
-
-    /// @notice Submit a cancellation request. The payer must wait
-    ///         `cancellationNoticePeriod` seconds before calling
-    ///         `finalizeCancellation`.
-    function requestCancellation(uint256 agreementId) external {
-        Agreement storage a = _requireActive(agreementId);
-        if (a.payer != msg.sender) revert NotPayer(agreementId, msg.sender);
-
-        a.cancellationRequestedAt = block.timestamp;
-        uint256 executeAfter = block.timestamp + a.cancellationNoticePeriod;
-
-        emit CancellationRequested(agreementId, msg.sender, executeAfter);
-    }
-
-    /// @notice Finalize cancellation after the notice period has elapsed.
-    ///         Pays out any unclaimed accrued amount to the recipient first,
-    ///         then refunds the remaining balance to the payer.
-    function finalizeCancellation(uint256 agreementId)
-        external
-        nonReentrant
-    {
-        Agreement storage a = _requireAgreement(agreementId);
-        if (!a.active)                         revert AgreementNotActive(agreementId);
-        if (a.cancellationRequestedAt == 0)    revert NoCancellationRequested(agreementId);
-
-        uint256 executeAfter = a.cancellationRequestedAt + a.cancellationNoticePeriod;
-        if (block.timestamp < executeAfter) {
-            revert NoticePeriodNotElapsed(agreementId, executeAfter);
+        require(ratePerSecond > 0, "StreamingAgreement: zero rate");
+        if (token != address(0)) {
+            require(acceptedTokens[token], "StreamingAgreement: token not accepted");
         }
 
-        // Pay recipient accrued amount before cancellation
-        uint256 accrued = claimableAmount(agreementId);
-        if (accrued > 0) {
-            a.totalClaimed       += accrued;
-            a.lastClaimedTime     = block.timestamp;
-            if (a.paused) {
-                a.accruedAtPause = 0;
-            }
-            _sendEth(a.recipient, accrued);
-            emit FundsClaimed(agreementId, a.recipient, accrued);
-        }
+        uint256 requiredDeposit = ratePerSecond * UPFRONT_DEPOSIT_DAYS * 1 days;
 
-        // Refund remaining balance to payer
-        uint256 remaining = a.totalDeposited - a.totalClaimed;
-        a.active = false;
-        _removeFromActive(agreementId);
-
-        emit AgreementCancelled(agreementId, remaining);
-
-        if (remaining > 0) {
-            _sendEth(payable(a.payer), remaining);
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // External – Recipient
-    // -------------------------------------------------------------------------
-
-    /// @notice Claim all accrued (but unclaimed) streamed ETH.
-    /// @dev    When the stream is paused, the snapshotted accruedAtPause amount
-    ///         is claimable and is cleared after a successful claim.
-    function claim(uint256 agreementId) external nonReentrant {
-        Agreement storage a = _requireActive(agreementId);
-        if (a.recipient != msg.sender) revert NotRecipient(agreementId, msg.sender);
-
-        uint256 amount = claimableAmount(agreementId);
-        if (amount == 0) revert NothingToClaim(agreementId);
-
-        a.totalClaimed += amount;
-
-        // If the stream is paused we consumed the snapshot; clear it.
-        // lastClaimedTime is not advanced while paused (resumeStream handles that).
-        if (a.paused) {
-            a.accruedAtPause = 0;
+        if (token == address(0)) {
+            require(msg.value >= requiredDeposit, "StreamingAgreement: insufficient ETH deposit");
         } else {
-            a.lastClaimedTime = block.timestamp;
+            require(msg.value == 0, "StreamingAgreement: ETH sent with token agreement");
+            IERC20(token).safeTransferFrom(msg.sender, address(this), requiredDeposit);
         }
 
-        emit FundsClaimed(agreementId, msg.sender, amount);
-        _sendEth(a.recipient, amount);
+        uint256 id = _nextAgreementId++;
+
+        Agreement storage a = agreements[id];
+        a.id                   = id;
+        a.payer                = msg.sender;
+        a.token                = token;
+        a.ratePerSecond        = ratePerSecond;
+        a.startTime            = block.timestamp;
+        a.lastClaimedTime      = block.timestamp;
+        a.endTime              = endTime;
+        a.slaMaxDowntimeHours  = slaMaxDowntime > 0 ? slaMaxDowntime : DEFAULT_SLA_MAX_DOWNTIME_HOURS;
+        a.slaMaxResponseHours  = slaMaxResponse > 0 ? slaMaxResponse : DEFAULT_SLA_MAX_RESPONSE_HOURS;
+        a.noticePeriodDays     = noticePeriod  > 0  ? noticePeriod  : DEFAULT_NOTICE_PERIOD_DAYS;
+        a.depositBalance       = requiredDeposit;
+
+        emit AgreementCreated(id, msg.sender, token, ratePerSecond, block.timestamp, endTime);
     }
 
     // -------------------------------------------------------------------------
-    // External – Anyone
+    // Claimable calculation
     // -------------------------------------------------------------------------
 
-    /// @notice Report an SLA breach for an agreement.
-    /// @param agreementId       The agreement to report.
-    /// @param breachDescription Human-readable description of the breach.
-    function reportSlaBreach(uint256 agreementId, string calldata breachDescription)
-        external
-    {
-        Agreement storage a = _requireAgreement(agreementId);
-        a.lastBreachDescription = breachDescription;
-
-        emit SlaBreachReported(agreementId, msg.sender, breachDescription);
-    }
-
-    // -------------------------------------------------------------------------
-    // External – Owner
-    // -------------------------------------------------------------------------
-
-    /// @notice Confirm or dismiss a reported SLA breach.
-    /// @param confirmed  If true, the breach is validated (owner may then pause).
-    function verifySlaBreach(uint256 agreementId, bool confirmed)
-        external
-        onlyOwner
-    {
-        _requireAgreement(agreementId);
-        emit SlaBreachVerified(agreementId, confirmed);
-    }
-
-    /// @notice Pause fund streaming for an agreement.
-    ///         The amount accrued up to this point is snapshotted in accruedAtPause
-    ///         so it remains claimable even while the stream is frozen.
-    function pauseStream(uint256 agreementId) external onlyOwner {
-        Agreement storage a = _requireActive(agreementId);
-        if (a.paused) revert AgreementAlreadyPaused(agreementId);
-
-        // Snapshot the amount earned so far before freezing the stream.
-        a.accruedAtPause = claimableAmount(agreementId);
-        a.paused = true;
-
-        emit StreamPaused(agreementId);
-    }
-
-    /// @notice Resume a paused stream.
-    ///         Advances lastClaimedTime to now so the paused duration is not
-    ///         double-counted, and clears the accruedAtPause snapshot.
-    function resumeStream(uint256 agreementId) external onlyOwner {
-        Agreement storage a = _requireActive(agreementId);
-        if (!a.paused) revert AgreementNotPaused(agreementId);
-
-        // Skip the paused duration by moving the clock forward.
-        a.lastClaimedTime = block.timestamp;
-        a.accruedAtPause  = 0;
-        a.paused          = false;
-
-        emit StreamResumed(agreementId);
-    }
-
-    // -------------------------------------------------------------------------
-    // Public – Views
-    // -------------------------------------------------------------------------
-
-    /// @notice Returns the ETH (in wei) that the recipient can currently claim.
-    /// @dev    When paused:  returns accruedAtPause (snapshotted at pause time).
-    ///         When active:  min(elapsed * ratePerSecond, remaining unclaimed balance).
-    function claimableAmount(uint256 agreementId) public view returns (uint256) {
-        Agreement storage a = _requireAgreement(agreementId);
-
-        if (!a.active) {
-            return 0;
-        }
+    /// @notice Returns the amount currently claimable for an agreement.
+    function claimable(uint256 agreementId) public view returns (uint256) {
+        Agreement storage a = _getAgreement(agreementId);
 
         if (a.paused) {
-            // Return the amount that was accrued at the moment the stream was paused.
             return a.accruedAtPause;
         }
 
-        uint256 elapsed   = block.timestamp - a.lastClaimedTime;
-        uint256 accrued   = elapsed * a.ratePerSecond;
-        uint256 remaining = a.totalDeposited - a.totalClaimed;
+        uint256 boundary = _effectiveEnd(a);
+        if (block.timestamp <= a.lastClaimedTime || block.timestamp <= a.startTime) {
+            return 0;
+        }
 
-        return accrued < remaining ? accrued : remaining;
+        uint256 elapsed = (boundary < block.timestamp ? boundary : block.timestamp) - a.lastClaimedTime;
+        return elapsed * a.ratePerSecond;
     }
 
-    /// @notice Retrieve a full agreement record.
-    function getAgreement(uint256 agreementId) external view returns (Agreement memory) {
-        return _requireAgreement(agreementId);
+    // -------------------------------------------------------------------------
+    // Claim – only treasury
+    // -------------------------------------------------------------------------
+
+    /// @notice Claim accrued stream to treasury.
+    function claim(uint256 agreementId) external nonReentrant whenNotPaused {
+        require(msg.sender == treasury, "StreamingAgreement: only treasury");
+
+        Agreement storage a = _getAgreement(agreementId);
+        require(!a.paused || a.accruedAtPause > 0, "StreamingAgreement: stream paused, nothing to claim");
+
+        uint256 amount = claimable(agreementId);
+        require(amount > 0, "StreamingAgreement: nothing to claim");
+        require(amount <= a.depositBalance, "StreamingAgreement: insufficient deposit");
+
+        // Advance state
+        if (a.paused) {
+            a.accruedAtPause = 0;
+        } else {
+            uint256 boundary = _effectiveEnd(a);
+            uint256 elapsed  = (boundary < block.timestamp ? boundary : block.timestamp) - a.lastClaimedTime;
+            a.lastClaimedTime = a.lastClaimedTime + elapsed;
+        }
+
+        a.totalClaimed   += amount;
+        a.totalStreamed   += amount;
+        a.depositBalance -= amount;
+
+        _transfer(a.token, treasury, amount);
+
+        emit StreamClaimed(agreementId, treasury, amount);
     }
 
-    /// @notice Returns all currently active agreement IDs.
-    function getActiveAgreements() external view returns (uint256[] memory) {
-        return _activeAgreementIds;
+    // -------------------------------------------------------------------------
+    // SLA breach reporting
+    // -------------------------------------------------------------------------
+
+    /// @notice Anyone can report an SLA breach. Owner can then pause the stream.
+    function reportSLABreach(uint256 agreementId, string calldata reason) external {
+        _getAgreement(agreementId); // existence check
+        require(bytes(reason).length > 0, "StreamingAgreement: empty reason");
+        emit SLABreachReported(agreementId, msg.sender, reason);
     }
+
+    // -------------------------------------------------------------------------
+    // Pause / resume (owner)
+    // -------------------------------------------------------------------------
+
+    /// @notice Pause stream and snapshot accrued-but-unclaimed amount.
+    function pauseStream(uint256 agreementId) external onlyOwner {
+        Agreement storage a = _getAgreement(agreementId);
+        require(!a.paused, "StreamingAgreement: already paused");
+
+        uint256 accrued = claimable(agreementId);
+        a.paused        = true;
+        a.accruedAtPause = accrued;
+
+        emit StreamPaused(agreementId, accrued);
+    }
+
+    /// @notice Resume a paused stream.  Advances lastClaimedTime to now and resets snapshot.
+    function resumeStream(uint256 agreementId) external onlyOwner {
+        Agreement storage a = _getAgreement(agreementId);
+        require(a.paused, "StreamingAgreement: not paused");
+
+        a.paused          = false;
+        a.accruedAtPause  = 0;
+        a.lastClaimedTime = block.timestamp;
+
+        emit StreamResumed(agreementId, block.timestamp);
+    }
+
+    // -------------------------------------------------------------------------
+    // Cancellation
+    // -------------------------------------------------------------------------
+
+    /// @notice Payer requests cancellation (starts notice period).
+    function requestCancellation(uint256 agreementId) external {
+        Agreement storage a = _getAgreement(agreementId);
+        require(msg.sender == a.payer, "StreamingAgreement: only payer");
+        require(a.cancellationRequestedAt == 0, "StreamingAgreement: already requested");
+
+        a.cancellationRequestedAt = block.timestamp;
+        emit CancellationRequested(agreementId, block.timestamp);
+    }
+
+    /// @notice Execute cancellation after notice period has elapsed.
+    ///         Refunds remaining deposit to payer.
+    function executeCancellation(uint256 agreementId) external nonReentrant {
+        Agreement storage a = _getAgreement(agreementId);
+        require(
+            msg.sender == a.payer || msg.sender == owner(),
+            "StreamingAgreement: not authorised"
+        );
+        require(a.cancellationRequestedAt > 0, "StreamingAgreement: cancellation not requested");
+        require(
+            block.timestamp >= a.cancellationRequestedAt + a.noticePeriodDays * 1 days,
+            "StreamingAgreement: notice period not elapsed"
+        );
+
+        // Claim any remaining accrued to treasury before cancellation
+        uint256 accrued = claimable(agreementId);
+        if (accrued > 0 && accrued <= a.depositBalance) {
+            a.totalClaimed   += accrued;
+            a.totalStreamed   += accrued;
+            a.depositBalance -= accrued;
+            _transfer(a.token, treasury, accrued);
+            emit StreamClaimed(agreementId, treasury, accrued);
+        }
+
+        uint256 refund = a.depositBalance;
+        a.depositBalance = 0;
+        a.endTime        = block.timestamp;
+
+        if (refund > 0) {
+            _transfer(a.token, a.payer, refund);
+        }
+
+        emit AgreementCancelled(agreementId, a.payer, refund);
+    }
+
+    // -------------------------------------------------------------------------
+    // Global pause (Pausable)
+    // -------------------------------------------------------------------------
+
+    function pause()   external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
 
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    function _requireAgreement(uint256 agreementId)
-        internal
-        view
-        returns (Agreement storage a)
-    {
-        a = agreements[agreementId];
-        if (a.payer == address(0)) revert AgreementNotFound(agreementId);
+    function _effectiveEnd(Agreement storage a) internal view returns (uint256) {
+        if (a.endTime > 0 && a.endTime < block.timestamp) return a.endTime;
+        return block.timestamp;
     }
 
-    function _requireActive(uint256 agreementId)
-        internal
-        view
-        returns (Agreement storage a)
-    {
-        a = _requireAgreement(agreementId);
-        if (!a.active) revert AgreementNotActive(agreementId);
+    function _transfer(address token, address to, uint256 amount) internal {
+        if (token == address(0)) {
+            (bool ok, ) = to.call{value: amount}("");
+            require(ok, "StreamingAgreement: ETH transfer failed");
+        } else {
+            IERC20(token).safeTransfer(to, amount);
+        }
     }
 
-    function _removeFromActive(uint256 agreementId) internal {
-        uint256 idx  = _activeIndex[agreementId];
-        uint256 last = _activeAgreementIds[_activeAgreementIds.length - 1];
-
-        _activeAgreementIds[idx] = last;
-        _activeIndex[last]       = idx;
-
-        _activeAgreementIds.pop();
-        delete _activeIndex[agreementId];
+    function _getAgreement(uint256 id) internal view returns (Agreement storage) {
+        require(id > 0 && id < _nextAgreementId, "StreamingAgreement: does not exist");
+        return agreements[id];
     }
 
-    function _sendEth(address payable to, uint256 amount) internal {
-        (bool success, ) = to.call{value: amount}("");
-        if (!success) revert TransferFailed(to, amount);
-    }
+    // -------------------------------------------------------------------------
+    // View helpers
+    // -------------------------------------------------------------------------
+
+    function totalAgreements() external view returns (uint256) { return _nextAgreementId - 1; }
+
+    // -------------------------------------------------------------------------
+    // Receive
+    // -------------------------------------------------------------------------
+
+    receive() external payable {}
 }

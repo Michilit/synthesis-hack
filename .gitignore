@@ -20,6 +20,9 @@ deployments/
 # Data files (may contain private keys or sensitive state)
 data/agent-identities.json
 data/treasury-state.json
+data/funding-history.json
+data/spend-log.json
+data/filecoin-cache/
 
 # Keep mock/seed data but not real state
 # data/mock-prs.json  <- OK to commit (mock data)

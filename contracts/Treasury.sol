@@ -1,681 +1,401 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.26;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @title Treasury - Multi-sig spending governance for DPI Guardians
-/// @notice Small amounts can be auto-spent by the owner alone.
-///         Larger amounts require MULTISIG_REQUIRED trustee approvals
-///         before execution. Supports both crypto yield and RWA allocations
-///         for a diversified, sustainable treasury strategy.
+/// @title Treasury
+/// @notice Multi-sig board spending, agent spending caps (by ERC-8004 tokenId),
+///         mock ERC-4626 yield deposits, and RWA allocation with a 40 % single-asset cap.
+///         No deployer address is emitted in events.
 contract Treasury is Ownable, ReentrancyGuard, Pausable {
-    // -------------------------------------------------------------------------
-    // Types
-    // -------------------------------------------------------------------------
-
-    /// @notice Categorical labels for spending proposals.
-    enum SpendingCategory {
-        OPERATIONAL,
-        AUDIT,
-        STIPEND,
-        INFRASTRUCTURE,
-        RESERVE
-    }
-
-    /// @notice Asset classes for treasury diversification.
-    enum AssetType {
-        CRYPTO_YIELD,        // ETH staking, liquid staking tokens
-        TOKENIZED_BONDS,     // Tokenized T-bills, corporate bonds (e.g. Ondo, Backed)
-        TOKENIZED_RE,        // Tokenized real estate (e.g. RealT, Tangible)
-        STABLECOINS,         // USDC, DAI held as liquidity buffer
-        OTHER_RWA            // Other real world assets
-    }
-
-    /// @notice A tracked RWA or yield allocation.
-    struct AssetAllocation {
-        uint256    id;
-        string     name;           // e.g. "Ondo OUSG", "RealT Detroit Property"
-        string     description;
-        AssetType  assetType;
-        uint256    allocatedWei;   // ETH-equivalent value tracked on-chain
-        uint256    targetBps;      // Target allocation in basis points (e.g. 2000 = 20%)
-        bool       active;
-        uint256    lastUpdated;
-    }
-
-    /// @notice A pending multi-sig spending proposal.
-    struct SpendingProposal {
-        uint256           id;
-        address           proposer;
-        address payable   recipient;
-        uint256           amount;
-        string            description;
-        SpendingCategory  category;
-        address[]         approvals;
-        bool              executed;
-        uint256           deadline;
-        bool              requiresHumanApproval;
-    }
-
-    /// @notice An immutable record of a completed spend.
-    struct SpendingRecord {
-        uint256          amount;
-        SpendingCategory category;
-        string           description;
-        uint256          timestamp;
-        address          recipient;
-    }
-
-    /// @notice A record of an agent action for auditability.
-    struct AgentAction {
-        uint256 agentTokenId;
-        string  actionType;
-        uint256 timestamp;
-        string  details;
-        address initiator;
-    }
+    using SafeERC20 for IERC20;
 
     // -------------------------------------------------------------------------
     // Constants
     // -------------------------------------------------------------------------
 
-    /// @notice Maximum amount (in wei) that the owner may spend without trustee votes.
     uint256 public constant AUTO_SPEND_THRESHOLD = 0.01 ether;
+    uint256 public constant MAX_SINGLE_BPS       = 4000; // 40 %
+    uint256 public constant BPS_DENOMINATOR      = 10_000;
+    uint256 public constant MAX_DESCRIPTION_BYTES = 500;
+    uint256 public constant MONTH_SECONDS        = 30 days;
 
-    /// @notice Number of trustee approvals required to execute a proposal.
-    uint256 public constant MULTISIG_REQUIRED = 2;
+    // -------------------------------------------------------------------------
+    // Enums
+    // -------------------------------------------------------------------------
+
+    enum AssetType { CRYPTO, STABLECOIN, TOKENIZED_BOND, REAL_ESTATE }
+
+    // -------------------------------------------------------------------------
+    // Structs
+    // -------------------------------------------------------------------------
+
+    struct SpendingProposal {
+        uint256 id;
+        address to;
+        address token;          // address(0) = ETH
+        uint256 amount;
+        string  description;
+        uint256 sigCount;
+        bool    executed;
+        bool    requiresHumanApproval;
+        address proposedBy;
+    }
+
+    struct AgentAction {
+        uint256 tokenId;
+        string  action;
+        uint256 amount;
+        uint256 timestamp;
+        string  description;
+    }
+
+    struct RWAPosition {
+        AssetType assetType;
+        uint256   amount;
+        string    assetName;
+    }
 
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
 
-    /// @notice Ordered list of trustee addresses.
-    address[] public trustees;
+    // Board multisig
+    address[] public boardMembers;
+    uint256   public requiredSignatures;
 
-    /// @notice Quick lookup: is this address a trustee?
-    mapping(address => bool) public isTrustee;
+    // Token whitelist
+    mapping(address => bool) public acceptedTokens;
 
-    uint256 private _proposalCounter;
-
-    /// @notice All spending proposals keyed by ID.
+    // Spending proposals
+    uint256 private _nextProposalId = 1;
     mapping(uint256 => SpendingProposal) public proposals;
+    mapping(uint256 => mapping(address => bool)) public proposalSigned;
 
-    /// @dev IDs of all proposals (used for getPendingProposals iteration).
-    uint256[] private _proposalIds;
-
-    /// @notice Immutable spending history.
-    SpendingRecord[] private _spendingHistory;
-
-    /// @notice Mock crypto yield vault balance (ETH staking / liquid staking).
-    uint256 public yieldBalance;
-
-    /// @notice Total ETH-equivalent allocated to RWA positions.
-    uint256 public rwaBalance;
-
-    /// @notice All asset allocations (crypto yield + RWA).
-    AssetAllocation[] private _allocations;
-
-    /// @dev Target: max 40% in any single asset class (anti-concentration).
-    uint256 public constant MAX_SINGLE_ASSET_BPS = 4000;
-
-    /// @notice Cumulative ETH received by this contract.
-    uint256 public totalReceived;
-
-    /// @notice Per-agent monthly spending cap in wei, keyed by ERC8004 tokenId.
+    // Agent spending caps (tokenId => cap per month in wei)
     mapping(uint256 => uint256) public agentSpendingCaps;
-
-    /// @notice Amount an agent has spent in the current month, keyed by ERC8004 tokenId.
     mapping(uint256 => uint256) public agentSpentThisMonth;
-
-    /// @notice Timestamp when the current monthly window resets, keyed by ERC8004 tokenId.
     mapping(uint256 => uint256) public agentSpendingResetTime;
 
-    /// @notice Log of all agent actions for auditability.
+    // Agent action log
     AgentAction[] public agentActionLog;
+
+    // Mock yield (ERC-4626 simulation)
+    uint256 public totalYieldDeposited;
+
+    // RWA positions
+    RWAPosition[] public rwaPositions;
+    uint256 public totalRWAAllocated;
 
     // -------------------------------------------------------------------------
     // Events
     // -------------------------------------------------------------------------
 
     event FundsReceived(address indexed sender, uint256 amount);
-    event AutoSpend(
-        address indexed recipient,
-        uint256 amount,
-        SpendingCategory category,
-        string description
-    );
-    event ProposalCreated(
-        uint256 indexed proposalId,
-        address indexed proposer,
-        address indexed recipient,
-        uint256 amount,
-        SpendingCategory category
-    );
-    event ProposalApproved(uint256 indexed proposalId, address indexed trustee);
-    event ProposalExecuted(uint256 indexed proposalId, address indexed recipient, uint256 amount);
-    event YieldDeposit(uint256 amount, uint256 newYieldBalance);
-    event YieldWithdraw(uint256 amount, uint256 newYieldBalance);
-    event RWAAllocated(uint256 indexed allocationId, string name, AssetType assetType, uint256 amount);
-    event RWAWithdrawn(uint256 indexed allocationId, uint256 amount);
-    event RWAAllocationUpdated(uint256 indexed allocationId, uint256 newAmount);
-    event TrusteeAdded(address indexed trustee);
-    event TrusteeRemoved(address indexed trustee);
-    event AgentSpendingCapSet(uint256 indexed agentTokenId, uint256 cap);
-    event AgentActionLogged(uint256 indexed agentTokenId, string actionType, uint256 timestamp);
-
-    // -------------------------------------------------------------------------
-    // Errors
-    // -------------------------------------------------------------------------
-
-    error NotTrustee(address caller);
-    error AlreadyTrustee(address addr);
-    error NotATrustee(address addr);
-    error AlreadyApproved(uint256 proposalId, address trustee);
-    error ProposalNotFound(uint256 proposalId);
-    error ProposalAlreadyExecuted(uint256 proposalId);
-    error ProposalExpired(uint256 proposalId);
-    error InsufficientApprovals(uint256 proposalId, uint256 given, uint256 required);
-    error InsufficientBalance(uint256 requested, uint256 available);
-    error AmountExceedsAutoThreshold(uint256 amount, uint256 threshold);
-    error ZeroAddress();
-    error ZeroAmount();
-    error TransferFailed(address to, uint256 amount);
-    error InsufficientYieldBalance(uint256 requested, uint256 available);
-    error ConcentrationLimitExceeded(uint256 allocationBps, uint256 maxBps);
-    error AllocationNotFound(uint256 allocationId);
-    error AllocationInactive(uint256 allocationId);
-    error AgentSpendingCapExceeded(uint256 agentTokenId, uint256 requested, uint256 remaining);
-    error HumanApprovalRequired(uint256 proposalId);
-    error DescriptionTooLong();
-    error InvalidCharacter();
+    event SpendingProposed(uint256 indexed proposalId, address to, address token, uint256 amount, string description);
+    event ProposalSigned(uint256 indexed proposalId, address indexed signer, uint256 sigCount);
+    event ProposalExecuted(uint256 indexed proposalId, address to, address token, uint256 amount);
+    event AgentActionLogged(uint256 indexed tokenId, string action, uint256 amount, string description);
+    event YieldDeposited(uint256 amount, uint256 totalYieldDeposited);
+    event RWAAllocated(AssetType indexed assetType, uint256 amount, string assetName);
+    event EmergencyPaused(address indexed by);
+    event AgentSpendingCapSet(uint256 indexed tokenId, uint256 cap);
+    event AutoSpend(address indexed to, uint256 amount, string description, uint256 indexed agentTokenId);
 
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
-    /// @param initialOwner  Address that becomes the contract owner.
-    constructor(address initialOwner) Ownable(initialOwner) {
-        _proposalCounter = 1;
+    /// @param _boardMembers       Initial board member addresses.
+    /// @param _requiredSignatures Number of signatures required to execute a proposal.
+    constructor(
+        address[] memory _boardMembers,
+        uint256          _requiredSignatures
+    ) Ownable(msg.sender) {
+        require(_boardMembers.length >= _requiredSignatures, "Treasury: sigThreshold too high");
+        require(_requiredSignatures > 0, "Treasury: zero threshold");
+
+        for (uint256 i = 0; i < _boardMembers.length; i++) {
+            require(_boardMembers[i] != address(0), "Treasury: zero board member");
+            boardMembers.push(_boardMembers[i]);
+        }
+        requiredSignatures = _requiredSignatures;
     }
 
     // -------------------------------------------------------------------------
-    // Receive
+    // Receive ETH
     // -------------------------------------------------------------------------
 
-    /// @notice Accept plain ETH transfers and record them.
     receive() external payable {
-        totalReceived += msg.value;
         emit FundsReceived(msg.sender, msg.value);
     }
 
     // -------------------------------------------------------------------------
-    // External – Emergency pause (owner only)
+    // Agent spending caps
     // -------------------------------------------------------------------------
 
-    /// @notice Pause all critical operations in an emergency.
-    function emergencyPause() external onlyOwner {
-        _pause();
+    function setAgentSpendingCap(uint256 tokenId, uint256 cap) external onlyOwner {
+        agentSpendingCaps[tokenId] = cap;
+        emit AgentSpendingCapSet(tokenId, cap);
     }
 
-    /// @notice Resume operations after an emergency pause.
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-
-    // -------------------------------------------------------------------------
-    // External – Trustee management (owner only)
-    // -------------------------------------------------------------------------
-
-    /// @notice Add a new trustee who may approve spending proposals.
-    function addTrustee(address trustee) external onlyOwner {
-        if (trustee == address(0)) revert ZeroAddress();
-        if (isTrustee[trustee])    revert AlreadyTrustee(trustee);
-
-        isTrustee[trustee] = true;
-        trustees.push(trustee);
-
-        emit TrusteeAdded(trustee);
-    }
-
-    /// @notice Remove an existing trustee.
-    function removeTrustee(address trustee) external onlyOwner {
-        if (!isTrustee[trustee]) revert NotATrustee(trustee);
-
-        isTrustee[trustee] = false;
-
-        // Swap-and-pop to remove from the array
-        uint256 len = trustees.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (trustees[i] == trustee) {
-                trustees[i] = trustees[len - 1];
-                trustees.pop();
-                break;
-            }
-        }
-
-        emit TrusteeRemoved(trustee);
-    }
-
-    // -------------------------------------------------------------------------
-    // External – Agent spending caps (owner only)
-    // -------------------------------------------------------------------------
-
-    /// @notice Set a monthly spending cap for an agent identified by ERC8004 tokenId.
-    /// @param agentTokenId  The ERC8004 token ID of the agent.
-    /// @param cap           Maximum wei the agent may spend per calendar month.
-    function setAgentSpendingCap(uint256 agentTokenId, uint256 cap) external onlyOwner {
-        agentSpendingCaps[agentTokenId] = cap;
-        emit AgentSpendingCapSet(agentTokenId, cap);
-    }
-
-    // -------------------------------------------------------------------------
-    // External – Agent action log (owner only)
-    // -------------------------------------------------------------------------
-
-    /// @notice Record an agent action for auditability.
-    /// @param agentTokenId  The ERC8004 token ID of the acting agent.
-    /// @param actionType    Short label for the action (e.g. "AUTO_SPEND").
-    /// @param details       Free-text details of the action.
-    function logAgentAction(
-        uint256 agentTokenId,
-        string calldata actionType,
-        string calldata details
-    ) external onlyOwner {
-        if (!_sanitizeDescription(details)) revert DescriptionTooLong();
-
-        agentActionLog.push(AgentAction({
-            agentTokenId: agentTokenId,
-            actionType:   actionType,
-            timestamp:    block.timestamp,
-            details:      details,
-            initiator:    msg.sender
-        }));
-
-        emit AgentActionLogged(agentTokenId, actionType, block.timestamp);
-    }
-
-    // -------------------------------------------------------------------------
-    // External – Spending (owner only)
-    // -------------------------------------------------------------------------
-
-    /// @notice Immediately send up to AUTO_SPEND_THRESHOLD ETH without a vote.
-    /// @param recipient    Address to send ETH to.
-    /// @param amount       Amount in wei (must be <= AUTO_SPEND_THRESHOLD).
-    /// @param description  Free-text reason.
-    /// @param category     Spending category.
-    /// @param agentTokenId ERC8004 token ID of the agent initiating the spend.
+    /// @notice Autonomous spend gated by agent cap (below AUTO_SPEND_THRESHOLD skips board approval).
     function autoSpend(
-        address payable recipient,
-        uint256 amount,
+        address        to,
+        uint256        amount,
         string calldata description,
-        SpendingCategory category,
-        uint256 agentTokenId
+        uint256        agentTokenId
     )
         external
         onlyOwner
         nonReentrant
         whenNotPaused
     {
-        if (!_sanitizeDescription(description)) revert DescriptionTooLong();
-        if (amount == 0)                        revert ZeroAmount();
-        if (recipient == address(0))            revert ZeroAddress();
-        if (amount > AUTO_SPEND_THRESHOLD)      revert AmountExceedsAutoThreshold(amount, AUTO_SPEND_THRESHOLD);
+        _sanitizeDescription(description);
+        require(to != address(0), "Treasury: zero recipient");
+        require(amount > 0,       "Treasury: zero amount");
+        require(amount <= AUTO_SPEND_THRESHOLD, "Treasury: exceeds auto-spend threshold");
 
-        uint256 available = address(this).balance - yieldBalance;
-        if (amount > available)                 revert InsufficientBalance(amount, available);
+        _resetAgentMonthIfNeeded(agentTokenId);
 
-        // Enforce per-agent monthly spending cap
         uint256 cap = agentSpendingCaps[agentTokenId];
-        if (cap > 0) {
-            // Reset monthly window if needed
-            if (block.timestamp >= agentSpendingResetTime[agentTokenId]) {
-                agentSpentThisMonth[agentTokenId] = 0;
-                agentSpendingResetTime[agentTokenId] = block.timestamp + 30 days;
-            }
-            uint256 spent = agentSpentThisMonth[agentTokenId];
-            if (spent + amount > cap) {
-                revert AgentSpendingCapExceeded(agentTokenId, amount, cap - spent);
-            }
-            agentSpentThisMonth[agentTokenId] = spent + amount;
-        }
+        require(cap > 0, "Treasury: no spending cap set for agent");
+        require(agentSpentThisMonth[agentTokenId] + amount <= cap, "Treasury: agent cap exceeded");
 
-        _spendingHistory.push(SpendingRecord({
-            amount:      amount,
-            category:    category,
-            description: description,
-            timestamp:   block.timestamp,
-            recipient:   recipient
-        }));
+        agentSpentThisMonth[agentTokenId] += amount;
 
-        emit AutoSpend(recipient, amount, category, description);
-        _sendEth(recipient, amount);
+        logAgentAction(agentTokenId, "autoSpend", amount, description);
+
+        (bool ok, ) = to.call{value: amount}("");
+        require(ok, "Treasury: ETH auto-spend failed");
+
+        emit AutoSpend(to, amount, description, agentTokenId);
     }
 
-    /// @notice Create a multi-sig spending proposal (requires MULTISIG_REQUIRED trustee approvals).
-    /// @param recipient             Address to receive ETH if approved.
-    /// @param amount                Amount in wei.
-    /// @param description           Free-text reason.
-    /// @param category              Spending category.
-    /// @param deadline              Unix timestamp after which the proposal may not be executed.
-    /// @param requiresHumanApproval If true, execution requires both a trustee and the owner to approve.
-    /// @return proposalId           The newly created proposal ID.
+    function _resetAgentMonthIfNeeded(uint256 tokenId) internal {
+        if (block.timestamp >= agentSpendingResetTime[tokenId] + MONTH_SECONDS) {
+            agentSpentThisMonth[tokenId]    = 0;
+            agentSpendingResetTime[tokenId] = block.timestamp;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Board multisig proposals
+    // -------------------------------------------------------------------------
+
     function proposeSpend(
-        address payable recipient,
-        uint256 amount,
-        string calldata description,
-        SpendingCategory category,
-        uint256 deadline,
-        bool requiresHumanApproval
+        address        to,
+        address        token,
+        uint256        amount,
+        string calldata description
     )
         external
-        onlyOwner
         returns (uint256 proposalId)
     {
-        if (!_sanitizeDescription(description)) revert DescriptionTooLong();
-        if (amount == 0)             revert ZeroAmount();
-        if (recipient == address(0)) revert ZeroAddress();
+        require(_isBoardMember(msg.sender), "Treasury: not a board member");
+        _sanitizeDescription(description);
+        require(to != address(0), "Treasury: zero recipient");
+        require(amount > 0,       "Treasury: zero amount");
 
-        proposalId = _proposalCounter;
-        unchecked { _proposalCounter++; }
+        proposalId = _nextProposalId++;
 
-        SpendingProposal storage p = proposals[proposalId];
-        p.id                   = proposalId;
-        p.proposer             = msg.sender;
-        p.recipient            = recipient;
-        p.amount               = amount;
-        p.description          = description;
-        p.category             = category;
-        p.executed             = false;
-        p.deadline             = deadline;
-        p.requiresHumanApproval = requiresHumanApproval;
-        // p.approvals is an empty dynamic array by default
+        proposals[proposalId] = SpendingProposal({
+            id:                   proposalId,
+            to:                   to,
+            token:                token,
+            amount:               amount,
+            description:          description,
+            sigCount:             0,
+            executed:             false,
+            requiresHumanApproval: amount > AUTO_SPEND_THRESHOLD,
+            proposedBy:           msg.sender
+        });
 
-        _proposalIds.push(proposalId);
-
-        emit ProposalCreated(proposalId, msg.sender, recipient, amount, category);
+        emit SpendingProposed(proposalId, to, token, amount, description);
     }
 
-    // -------------------------------------------------------------------------
-    // External – Proposal approval (trustees)
-    // -------------------------------------------------------------------------
+    function signProposal(uint256 proposalId) external nonReentrant whenNotPaused {
+        require(_isBoardMember(msg.sender), "Treasury: not a board member");
 
-    /// @notice Approve a pending spending proposal.
-    /// @dev    Each trustee may approve a proposal at most once.
-    function approveProposal(uint256 proposalId) external {
-        if (!isTrustee[msg.sender]) revert NotTrustee(msg.sender);
+        SpendingProposal storage p = _getProposal(proposalId);
+        require(!p.executed, "Treasury: already executed");
+        require(!proposalSigned[proposalId][msg.sender], "Treasury: already signed");
 
-        SpendingProposal storage p = _requireProposal(proposalId);
-        if (p.executed) revert ProposalAlreadyExecuted(proposalId);
-        if (p.deadline != 0 && block.timestamp > p.deadline) revert ProposalExpired(proposalId);
+        proposalSigned[proposalId][msg.sender] = true;
+        p.sigCount += 1;
 
-        // Check for double-voting
-        uint256 len = p.approvals.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (p.approvals[i] == msg.sender) revert AlreadyApproved(proposalId, msg.sender);
+        emit ProposalSigned(proposalId, msg.sender, p.sigCount);
+
+        if (p.sigCount >= requiredSignatures) {
+            _executeProposal(p);
+        }
+    }
+
+    function _executeProposal(SpendingProposal storage p) internal {
+        p.executed = true;
+
+        if (p.token == address(0)) {
+            (bool ok, ) = p.to.call{value: p.amount}("");
+            require(ok, "Treasury: ETH transfer failed");
+        } else {
+            IERC20(p.token).safeTransfer(p.to, p.amount);
         }
 
-        p.approvals.push(msg.sender);
-        emit ProposalApproved(proposalId, msg.sender);
+        emit ProposalExecuted(p.id, p.to, p.token, p.amount);
     }
 
     // -------------------------------------------------------------------------
-    // External – Proposal execution
+    // Agent action log
     // -------------------------------------------------------------------------
 
-    /// @notice Execute an approved proposal, transferring ETH to the recipient.
-    /// @dev    Requires at least MULTISIG_REQUIRED trustee approvals.
-    ///         If requiresHumanApproval is set, at least one approval must come
-    ///         from a trustee AND one from the owner.
-    function executeProposal(uint256 proposalId)
+    function logAgentAction(
+        uint256        tokenId,
+        string memory  action,
+        uint256        amount,
+        string memory  description
+    ) public onlyOwner {
+        agentActionLog.push(AgentAction({
+            tokenId:     tokenId,
+            action:      action,
+            amount:      amount,
+            timestamp:   block.timestamp,
+            description: description
+        }));
+        emit AgentActionLogged(tokenId, action, amount, description);
+    }
+
+    // -------------------------------------------------------------------------
+    // Mock yield (ERC-4626 style)
+    // -------------------------------------------------------------------------
+
+    /// @notice Deposit ETH into the mock yield vault (MOCK_YIELD=true).
+    function depositToYield(uint256 amount) external onlyOwner nonReentrant whenNotPaused {
+        require(amount > 0, "Treasury: zero amount");
+        require(address(this).balance >= amount, "Treasury: insufficient balance");
+        totalYieldDeposited += amount;
+        // In mock mode: no actual transfer to an external vault.
+        emit YieldDeposited(amount, totalYieldDeposited);
+    }
+
+    // -------------------------------------------------------------------------
+    // RWA allocation
+    // -------------------------------------------------------------------------
+
+    function allocateToRWA(
+        AssetType      assetType,
+        uint256        amount,
+        string calldata assetName
+    )
         external
+        onlyOwner
         nonReentrant
         whenNotPaused
     {
-        SpendingProposal storage p = _requireProposal(proposalId);
-        if (p.executed) revert ProposalAlreadyExecuted(proposalId);
-        if (p.deadline != 0 && block.timestamp > p.deadline) revert ProposalExpired(proposalId);
+        require(amount > 0, "Treasury: zero amount");
+        require(bytes(assetName).length > 0, "Treasury: empty asset name");
 
-        uint256 approvalCount = p.approvals.length;
-        if (approvalCount < MULTISIG_REQUIRED) {
-            revert InsufficientApprovals(proposalId, approvalCount, MULTISIG_REQUIRED);
-        }
+        uint256 newTotal = totalRWAAllocated + amount;
+        uint256 balance  = address(this).balance;
+        require(balance > 0, "Treasury: zero balance");
 
-        // Human-override check: requires at least one trustee approval AND the owner's approval
-        if (p.requiresHumanApproval) {
-            bool hasTrusteeApproval = false;
-            bool hasOwnerApproval   = false;
-            address ownerAddr = owner();
-            for (uint256 i = 0; i < approvalCount; i++) {
-                address approver = p.approvals[i];
-                if (isTrustee[approver]) hasTrusteeApproval = true;
-                if (approver == ownerAddr) hasOwnerApproval = true;
-            }
-            if (!hasTrusteeApproval || !hasOwnerApproval) {
-                revert HumanApprovalRequired(proposalId);
-            }
-        }
+        // Single-asset type may not exceed MAX_SINGLE_BPS of total balance
+        uint256 typeTotal = _rwaTypeTotal(assetType) + amount;
+        require(
+            typeTotal * BPS_DENOMINATOR <= balance * MAX_SINGLE_BPS,
+            "Treasury: exceeds 40% single-asset cap"
+        );
 
-        uint256 available = address(this).balance - yieldBalance;
-        if (p.amount > available) revert InsufficientBalance(p.amount, available);
-
-        p.executed = true;
-
-        _spendingHistory.push(SpendingRecord({
-            amount:      p.amount,
-            category:    p.category,
-            description: p.description,
-            timestamp:   block.timestamp,
-            recipient:   p.recipient
+        rwaPositions.push(RWAPosition({
+            assetType: assetType,
+            amount:    amount,
+            assetName: assetName
         }));
+        totalRWAAllocated = newTotal;
 
-        emit ProposalExecuted(proposalId, p.recipient, p.amount);
-        _sendEth(p.recipient, p.amount);
+        emit RWAAllocated(assetType, amount, assetName);
     }
 
-    // -------------------------------------------------------------------------
-    // External – Yield vault (mock, owner only)
-    // -------------------------------------------------------------------------
-
-    /// @notice Move ETH from the liquid balance into the mock yield vault.
-    /// @dev    The ETH stays in this contract but is tracked as "yielding".
-    function depositToYield(uint256 amount) external onlyOwner nonReentrant whenNotPaused {
-        if (amount == 0) revert ZeroAmount();
-        uint256 liquid = address(this).balance - yieldBalance;
-        if (amount > liquid) revert InsufficientBalance(amount, liquid);
-
-        yieldBalance += amount;
-        emit YieldDeposit(amount, yieldBalance);
-    }
-
-    /// @notice Withdraw ETH from the mock yield vault back to the liquid balance.
-    function withdrawFromYield(uint256 amount) external onlyOwner nonReentrant {
-        if (amount == 0)           revert ZeroAmount();
-        if (amount > yieldBalance) revert InsufficientYieldBalance(amount, yieldBalance);
-
-        yieldBalance -= amount;
-        emit YieldWithdraw(amount, yieldBalance);
-    }
-
-    // -------------------------------------------------------------------------
-    // External – RWA diversification (owner + multisig for large amounts)
-    // -------------------------------------------------------------------------
-
-    /// @notice Record a new RWA allocation (tokenized bonds, real estate, etc.).
-    /// @dev    ETH is tracked as allocated; in production this would bridge to
-    ///         an RWA protocol. For the hackathon demo this is mock accounting.
-    /// @param name         Human-readable name (e.g. "Ondo OUSG T-bill fund").
-    /// @param description  Description of the asset.
-    /// @param assetType    Asset class enum.
-    /// @param amount       ETH-equivalent amount to allocate.
-    /// @param targetBps    Target portfolio weight in basis points.
-    function allocateToRWA(
-        string calldata name,
-        string calldata description,
-        AssetType assetType,
-        uint256 amount,
-        uint256 targetBps
-    ) external onlyOwner nonReentrant whenNotPaused returns (uint256 allocationId) {
-        if (amount == 0)                           revert ZeroAmount();
-        if (targetBps > MAX_SINGLE_ASSET_BPS)      revert ConcentrationLimitExceeded(targetBps, MAX_SINGLE_ASSET_BPS);
-
-        uint256 liquid = address(this).balance - yieldBalance - rwaBalance;
-        if (amount > liquid)                       revert InsufficientBalance(amount, liquid);
-
-        allocationId = _allocations.length;
-        _allocations.push(AssetAllocation({
-            id:           allocationId,
-            name:         name,
-            description:  description,
-            assetType:    assetType,
-            allocatedWei: amount,
-            targetBps:    targetBps,
-            active:       true,
-            lastUpdated:  block.timestamp
-        }));
-
-        rwaBalance += amount;
-        emit RWAAllocated(allocationId, name, assetType, amount);
-    }
-
-    /// @notice Update the recorded value of an RWA allocation (mark-to-market).
-    /// @param allocationId  The allocation to update.
-    /// @param newAmount     New ETH-equivalent value.
-    function updateRWAValue(uint256 allocationId, uint256 newAmount)
-        external
-        onlyOwner
-    {
-        if (allocationId >= _allocations.length) revert AllocationNotFound(allocationId);
-        AssetAllocation storage a = _allocations[allocationId];
-        if (!a.active) revert AllocationInactive(allocationId);
-
-        rwaBalance = rwaBalance - a.allocatedWei + newAmount;
-        a.allocatedWei = newAmount;
-        a.lastUpdated  = block.timestamp;
-
-        emit RWAAllocationUpdated(allocationId, newAmount);
-    }
-
-    /// @notice Withdraw (liquidate) an RWA allocation back to liquid balance.
-    /// @param allocationId  The allocation to close.
-    function withdrawFromRWA(uint256 allocationId)
-        external
-        onlyOwner
-        nonReentrant
-    {
-        if (allocationId >= _allocations.length) revert AllocationNotFound(allocationId);
-        AssetAllocation storage a = _allocations[allocationId];
-        if (!a.active) revert AllocationInactive(allocationId);
-
-        uint256 amount = a.allocatedWei;
-        rwaBalance    -= amount;
-        a.allocatedWei = 0;
-        a.active       = false;
-        a.lastUpdated  = block.timestamp;
-
-        emit RWAWithdrawn(allocationId, amount);
-    }
-
-    /// @notice Returns all asset allocations (active and inactive).
-    function getAllocations() external view returns (AssetAllocation[] memory) {
-        return _allocations;
-    }
-
-    /// @notice Returns only active RWA allocations.
-    function getActiveAllocations() external view returns (AssetAllocation[] memory) {
-        uint256 count = 0;
-        for (uint256 i = 0; i < _allocations.length; i++) {
-            if (_allocations[i].active) count++;
+    function _rwaTypeTotal(AssetType t) internal view returns (uint256 total) {
+        for (uint256 i = 0; i < rwaPositions.length; i++) {
+            if (rwaPositions[i].assetType == t) total += rwaPositions[i].amount;
         }
-        AssetAllocation[] memory active = new AssetAllocation[](count);
-        uint256 idx = 0;
-        for (uint256 i = 0; i < _allocations.length; i++) {
-            if (_allocations[i].active) active[idx++] = _allocations[i];
-        }
-        return active;
-    }
-
-    /// @notice Returns the liquid ETH balance (excludes yield vault and RWA allocations).
-    function getLiquidBalance() external view returns (uint256) {
-        return address(this).balance - yieldBalance - rwaBalance;
     }
 
     // -------------------------------------------------------------------------
-    // External – Views
+    // Token whitelist
     // -------------------------------------------------------------------------
 
-    /// @notice Returns the liquid ETH balance (excludes yield vault and RWA allocations).
-    function getBalance() external view returns (uint256) {
-        return address(this).balance - yieldBalance - rwaBalance;
+    function setAcceptedToken(address token, bool accepted) external onlyOwner {
+        require(token != address(0), "Treasury: zero address");
+        acceptedTokens[token] = accepted;
     }
 
-    /// @notice Returns the full spending history.
-    function getSpendingHistory() external view returns (SpendingRecord[] memory) {
-        return _spendingHistory;
+    // -------------------------------------------------------------------------
+    // Emergency controls
+    // -------------------------------------------------------------------------
+
+    function emergencyPause() external onlyOwner {
+        _pause();
+        emit EmergencyPaused(msg.sender);
     }
 
-    /// @notice Returns all proposals that have not yet been executed.
-    function getPendingProposals() external view returns (SpendingProposal[] memory) {
-        uint256 total   = _proposalIds.length;
-        uint256 pending = 0;
+    function unpause() external onlyOwner { _unpause(); }
 
-        // Count pending
-        for (uint256 i = 0; i < total; i++) {
-            if (!proposals[_proposalIds[i]].executed) pending++;
+    // -------------------------------------------------------------------------
+    // Description sanitisation
+    // -------------------------------------------------------------------------
+
+    function _sanitizeDescription(string calldata desc) internal pure {
+        bytes memory b = bytes(desc);
+        require(b.length > 0,                       "Treasury: empty description");
+        require(b.length <= MAX_DESCRIPTION_BYTES,  "Treasury: description too long");
+        for (uint256 i = 0; i < b.length; i++) {
+            require(b[i] != 0x00, "Treasury: null byte in description");
         }
+    }
 
-        SpendingProposal[] memory result = new SpendingProposal[](pending);
-        uint256 idx = 0;
-        for (uint256 i = 0; i < total; i++) {
-            SpendingProposal storage p = proposals[_proposalIds[i]];
-            if (!p.executed) {
-                result[idx] = p;
-                idx++;
-            }
+    // -------------------------------------------------------------------------
+    // Board helpers
+    // -------------------------------------------------------------------------
+
+    function _isBoardMember(address addr) internal view returns (bool) {
+        for (uint256 i = 0; i < boardMembers.length; i++) {
+            if (boardMembers[i] == addr) return true;
         }
-        return result;
+        return false;
     }
 
-    /// @notice Returns the current trustees array.
-    function getTrustees() external view returns (address[] memory) {
-        return trustees;
+    function addBoardMember(address member) external onlyOwner {
+        require(member != address(0), "Treasury: zero address");
+        require(!_isBoardMember(member), "Treasury: already a member");
+        boardMembers.push(member);
     }
 
-    /// @notice Returns the full agent action log.
-    function getAgentActionLog() external view returns (AgentAction[] memory) {
-        return agentActionLog;
+    function setRequiredSignatures(uint256 sigs) external onlyOwner {
+        require(sigs > 0 && sigs <= boardMembers.length, "Treasury: invalid threshold");
+        requiredSignatures = sigs;
     }
 
     // -------------------------------------------------------------------------
     // Internal helpers
     // -------------------------------------------------------------------------
 
-    function _requireProposal(uint256 proposalId)
-        internal
-        view
-        returns (SpendingProposal storage p)
-    {
-        p = proposals[proposalId];
-        // A proposal is considered found if its ID field is set
-        if (p.id == 0 && proposalId != 0) revert ProposalNotFound(proposalId);
-        if (p.id != proposalId)           revert ProposalNotFound(proposalId);
+    function _getProposal(uint256 id) internal view returns (SpendingProposal storage) {
+        require(id > 0 && id < _nextProposalId, "Treasury: proposal does not exist");
+        return proposals[id];
     }
 
-    function _sendEth(address payable to, uint256 amount) internal {
-        (bool success, ) = to.call{value: amount}("");
-        if (!success) revert TransferFailed(to, amount);
-    }
+    // -------------------------------------------------------------------------
+    // View helpers
+    // -------------------------------------------------------------------------
 
-    /// @notice Validate a free-text description against injection and length limits.
-    /// @dev    Returns true if valid; reverts with a specific error if invalid.
-    ///         Rejects descriptions longer than 500 bytes or containing null bytes (0x00).
-    function _sanitizeDescription(string calldata desc) internal pure returns (bool valid) {
-        bytes calldata b = bytes(desc);
-        if (b.length > 500) revert DescriptionTooLong();
-        for (uint256 i = 0; i < b.length; i++) {
-            if (b[i] == 0x00) revert InvalidCharacter();
-        }
-        return true;
-    }
+    function getBoardMembers() external view returns (address[] memory) { return boardMembers; }
+
+    function agentActionLogLength() external view returns (uint256) { return agentActionLog.length; }
+
+    function rwaPositionsLength() external view returns (uint256) { return rwaPositions.length; }
 }

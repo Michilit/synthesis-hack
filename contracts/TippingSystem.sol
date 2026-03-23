@@ -1,71 +1,73 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity 0.8.26;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/utils/Pausable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
-/// @title TippingSystem - Community tipping for DPI Guardians
-/// @notice Supports three predefined tiers (COFFEE, SPRINT, CHAMPION) plus
-///         an open CUSTOM tier. All funds are forwarded immediately to a
-///         configurable treasury address. Tippers may opt for anonymity.
-contract TippingSystem is Ownable, ReentrancyGuard {
+/// @title TippingSystem
+/// @notice Accepts ETH and whitelisted ERC-20 tips; routes all funds to treasury.
+///         Supports predefined tiers, anonymous tipping, and per-address rate-limit tracking.
+contract TippingSystem is Ownable, ReentrancyGuard, Pausable {
+    using SafeERC20 for IERC20;
+
     // -------------------------------------------------------------------------
-    // Types
+    // Constants – tier identifiers
     // -------------------------------------------------------------------------
 
-    /// @notice Predefined tip tiers with associated ETH amounts.
-    enum Tier {
-        COFFEE,   // 0.01 ETH  – 1 hour of CI/CD pipeline costs
-        SPRINT,   // 0.10 ETH  – 1 week of infrastructure
-        CHAMPION, // 1.00 ETH  – 1 month of full operations
-        CUSTOM    // Any non-zero amount chosen by the tipper
-    }
+    uint8 public constant TIER_OPEN = 0;
+    uint8 public constant TIER_1    = 1; // 0.001 ETH – "1 week CI costs"
+    uint8 public constant TIER_2    = 2; // 0.01  ETH – "1 month security audit"
+    uint8 public constant TIER_3    = 3; // 0.1   ETH – "3 months of dependency management"
 
-    /// @notice A single recorded tip.
-    struct Tip {
-        address tipper;    // address(0) when anonymous
+    uint256 public constant TIER_1_AMOUNT = 0.001 ether;
+    uint256 public constant TIER_2_AMOUNT = 0.01  ether;
+    uint256 public constant TIER_3_AMOUNT = 0.1   ether;
+
+    // -------------------------------------------------------------------------
+    // Structs
+    // -------------------------------------------------------------------------
+
+    struct TierInfo {
         uint256 amount;
-        Tier    tier;
-        bool    isAnonymous;
-        string  message;
-        uint256 timestamp;
+        string  humanDescription;
+        string  agentDescription;
     }
 
-    // -------------------------------------------------------------------------
-    // Constants – Tier amounts
-    // -------------------------------------------------------------------------
-
-    uint256 public constant COFFEE_AMOUNT   = 0.01 ether;
-    uint256 public constant SPRINT_AMOUNT   = 0.10 ether;
-    uint256 public constant CHAMPION_AMOUNT = 1.00 ether;
-
-    // -------------------------------------------------------------------------
-    // Constants – Tier descriptions
-    // -------------------------------------------------------------------------
-
-    string public constant COFFEE_DESC   = "Funds 1 hour of CI/CD pipeline costs";
-    string public constant SPRINT_DESC   = "Funds 1 week of infrastructure";
-    string public constant CHAMPION_DESC = "Funds 1 month of full operations";
+    struct TipRecord {
+        address tipper;        // address(0) when isAnonymous
+        address token;         // address(0) = ETH
+        uint256 amount;
+        uint8   tier;
+        bool    isAnonymous;
+        bool    displayAmount;
+        uint256 timestamp;
+        string  message;
+    }
 
     // -------------------------------------------------------------------------
     // State
     // -------------------------------------------------------------------------
 
-    /// @notice Address that receives all tip funds.
-    address payable public treasury;
+    address public immutable treasury;
 
-    /// @notice Chronological history of all tips.
-    Tip[] private _tips;
+    mapping(uint8 => TierInfo) public tiers;
 
-    /// @notice Cumulative ETH tipped by each address (non-anonymous contributions only).
-    mapping(address => uint256) public totalTippedBy;
+    // Token whitelist; address(0) represents native ETH (always accepted)
+    mapping(address => bool) public acceptedTokens;
 
-    /// @notice Total ETH raised through this contract.
-    uint256 public totalRaised;
+    // Rate-limit state
+    mapping(address => uint256) public lastTipRequest;   // last tip timestamp
+    mapping(address => uint256) public tipHistory;        // cumulative amount tipped
+    uint256 public averageTipAmount;
 
-    /// @dev Tracks unique non-anonymous tipper addresses for getTopTippers.
-    address[] private _uniqueTippers;
-    mapping(address => bool) private _isTipper;
+    uint256 private _totalTipCount;
+    uint256 private _totalTipSum;
+
+    // Public tip log
+    TipRecord[] public tipLog;
 
     // -------------------------------------------------------------------------
     // Events
@@ -73,172 +75,193 @@ contract TippingSystem is Ownable, ReentrancyGuard {
 
     event TipReceived(
         address indexed tipper,
-        uint256         amount,
-        Tier            tier,
-        string          message,
-        bool            isAnonymous
+        address indexed token,
+        uint256 amount,
+        uint8   tier,
+        bool    isAnonymous,
+        string  message
     );
 
-    event TreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
-
-    // -------------------------------------------------------------------------
-    // Errors
-    // -------------------------------------------------------------------------
-
-    error WrongTierAmount(Tier tier, uint256 required, uint256 sent);
-    error CustomAmountZero();
-    error ZeroAddress();
-    error TransferFailed();
-    error InvalidTier();
+    event AcceptedTokenSet(address indexed token, bool accepted);
 
     // -------------------------------------------------------------------------
     // Constructor
     // -------------------------------------------------------------------------
 
-    /// @param _treasury     Address that receives all forwarded tip funds.
-    /// @param initialOwner  Owner address (can update treasury).
-    constructor(address payable _treasury, address initialOwner) Ownable(initialOwner) {
-        if (_treasury == address(0)) revert ZeroAddress();
+    /// @param _treasury  Destination address for all tip proceeds.
+    /// @param _usdc      USDC token address to whitelist (can be address(0) to skip).
+    /// @param _dai       DAI  token address to whitelist (can be address(0) to skip).
+    /// @param _weth      WETH token address to whitelist (can be address(0) to skip).
+    constructor(
+        address _treasury,
+        address _usdc,
+        address _dai,
+        address _weth
+    ) Ownable(msg.sender) {
+        require(_treasury != address(0), "TippingSystem: zero treasury");
         treasury = _treasury;
+
+        tiers[TIER_1] = TierInfo({
+            amount:           TIER_1_AMOUNT,
+            humanDescription: "1 week CI costs",
+            agentDescription: "Small maintenance tier covering one week of continuous-integration costs."
+        });
+        tiers[TIER_2] = TierInfo({
+            amount:           TIER_2_AMOUNT,
+            humanDescription: "1 month security audit",
+            agentDescription: "Medium support tier covering one month of security-audit costs."
+        });
+        tiers[TIER_3] = TierInfo({
+            amount:           TIER_3_AMOUNT,
+            humanDescription: "3 months of dependency management",
+            agentDescription: "Large sustainer tier covering three months of dependency-management costs."
+        });
+
+        if (_usdc != address(0)) { acceptedTokens[_usdc] = true; emit AcceptedTokenSet(_usdc, true); }
+        if (_dai  != address(0)) { acceptedTokens[_dai]  = true; emit AcceptedTokenSet(_dai,  true); }
+        if (_weth != address(0)) { acceptedTokens[_weth] = true; emit AcceptedTokenSet(_weth, true); }
     }
 
     // -------------------------------------------------------------------------
-    // External – Tipping
+    // Tipping – ETH
     // -------------------------------------------------------------------------
 
-    /// @notice Send a tip in the specified tier.
-    /// @dev    For COFFEE/SPRINT/CHAMPION, msg.value must equal the exact tier
-    ///         amount. For CUSTOM, msg.value must be greater than zero.
-    /// @param tier      One of the Tier enum values.
-    /// @param message   Optional free-text message from the tipper.
-    /// @param anon      If true, the tipper's address is not recorded or emitted.
-    function tip(Tier tier, string calldata message, bool anon)
+    /// @notice Send a native-ETH tip.
+    /// @param tier          Predefined tier id (0 = open amount).
+    /// @param isAnonymous   If true, tipper address is masked to address(0) in the event.
+    /// @param displayAmount Whether the public tip record should reveal the amount.
+    /// @param message       Optional freeform message.
+    function tipETH(
+        uint8          tier,
+        bool           isAnonymous,
+        bool           displayAmount,
+        string calldata message
+    )
         external
         payable
         nonReentrant
+        whenNotPaused
     {
-        if (tier == Tier.COFFEE) {
-            if (msg.value != COFFEE_AMOUNT) {
-                revert WrongTierAmount(Tier.COFFEE, COFFEE_AMOUNT, msg.value);
-            }
-        } else if (tier == Tier.SPRINT) {
-            if (msg.value != SPRINT_AMOUNT) {
-                revert WrongTierAmount(Tier.SPRINT, SPRINT_AMOUNT, msg.value);
-            }
-        } else if (tier == Tier.CHAMPION) {
-            if (msg.value != CHAMPION_AMOUNT) {
-                revert WrongTierAmount(Tier.CHAMPION, CHAMPION_AMOUNT, msg.value);
-            }
-        } else if (tier == Tier.CUSTOM) {
-            if (msg.value == 0) revert CustomAmountZero();
-        } else {
-            revert InvalidTier();
-        }
+        require(msg.value > 0, "TippingSystem: zero value");
+        _validateTier(tier, msg.value);
+        _recordTip(msg.sender, address(0), msg.value, tier, isAnonymous, displayAmount, message);
 
-        address tipperAddr = anon ? address(0) : msg.sender;
+        (bool ok, ) = treasury.call{value: msg.value}("");
+        require(ok, "TippingSystem: ETH transfer failed");
+    }
 
-        _tips.push(Tip({
-            tipper:    tipperAddr,
-            amount:    msg.value,
-            tier:      tier,
-            isAnonymous: anon,
-            message:   message,
-            timestamp: block.timestamp
+    // -------------------------------------------------------------------------
+    // Tipping – ERC-20
+    // -------------------------------------------------------------------------
+
+    /// @notice Send an ERC-20 tip.
+    function tipERC20(
+        address        token,
+        uint256        amount,
+        uint8          tier,
+        bool           isAnonymous,
+        bool           displayAmount,
+        string calldata message
+    )
+        external
+        nonReentrant
+        whenNotPaused
+    {
+        require(acceptedTokens[token], "TippingSystem: token not accepted");
+        require(amount > 0, "TippingSystem: zero amount");
+        _validateTier(tier, amount);
+        _recordTip(msg.sender, token, amount, tier, isAnonymous, displayAmount, message);
+
+        IERC20(token).safeTransferFrom(msg.sender, treasury, amount);
+    }
+
+    // -------------------------------------------------------------------------
+    // Internal helpers
+    // -------------------------------------------------------------------------
+
+    function _validateTier(uint8 tier, uint256 amount) internal pure {
+        if      (tier == TIER_1) require(amount == TIER_1_AMOUNT, "TippingSystem: wrong TIER_1 amount");
+        else if (tier == TIER_2) require(amount == TIER_2_AMOUNT, "TippingSystem: wrong TIER_2 amount");
+        else if (tier == TIER_3) require(amount == TIER_3_AMOUNT, "TippingSystem: wrong TIER_3 amount");
+        // TIER_OPEN (0) accepts any positive amount
+    }
+
+    function _recordTip(
+        address         sender,
+        address         token,
+        uint256         amount,
+        uint8           tier,
+        bool            isAnon,
+        bool            displayAmount,
+        string calldata message
+    ) internal {
+        updateRateLimit(sender, amount);
+
+        address emittedTipper = isAnon ? address(0) : sender;
+
+        tipLog.push(TipRecord({
+            tipper:        emittedTipper,
+            token:         token,
+            amount:        amount,
+            tier:          tier,
+            isAnonymous:   isAnon,
+            displayAmount: displayAmount,
+            timestamp:     block.timestamp,
+            message:       message
         }));
 
-        totalRaised += msg.value;
-
-        if (!anon) {
-            totalTippedBy[msg.sender] += msg.value;
-            if (!_isTipper[msg.sender]) {
-                _isTipper[msg.sender] = true;
-                _uniqueTippers.push(msg.sender);
-            }
-        }
-
-        emit TipReceived(tipperAddr, msg.value, tier, message, anon);
-
-        (bool success, ) = treasury.call{value: msg.value}("");
-        if (!success) revert TransferFailed();
+        emit TipReceived(emittedTipper, token, amount, tier, isAnon, message);
     }
 
     // -------------------------------------------------------------------------
-    // External – Admin
+    // Rate limiting
     // -------------------------------------------------------------------------
 
-    /// @notice Update the treasury address that receives all future tips.
-    /// @param newTreasury New treasury address; must be non-zero.
-    function updateTreasury(address payable newTreasury) external onlyOwner {
-        if (newTreasury == address(0)) revert ZeroAddress();
-        address old = treasury;
-        treasury = newTreasury;
-        emit TreasuryUpdated(old, newTreasury);
+    /// @notice Update rate-limit state for a user after a tip.
+    function updateRateLimit(address user, uint256 amount) internal {
+        lastTipRequest[user]  = block.timestamp;
+        tipHistory[user]     += amount;
+
+        _totalTipSum   += amount;
+        _totalTipCount += 1;
+        averageTipAmount = _totalTipSum / _totalTipCount;
+    }
+
+    /// @notice Returns the rate-limit tier for a given user.
+    /// @return  0 = never donated, 1 = below average, 2 = above average, 3 = agent-level
+    function getRateLimitTier(address user) external view returns (uint8) {
+        if (tipHistory[user] == 0)                         return 0;
+        if (tipHistory[user] < averageTipAmount)           return 1;
+        if (tipHistory[user] >= averageTipAmount * 3)      return 3;
+        return 2;
     }
 
     // -------------------------------------------------------------------------
-    // External – Views
+    // Owner administration
     // -------------------------------------------------------------------------
 
-    /// @notice Returns the fixed ETH amount for a given tier.
-    /// @dev    Returns 0 for CUSTOM (no fixed amount).
-    function getTierAmount(Tier tier) external pure returns (uint256) {
-        if (tier == Tier.COFFEE)   return COFFEE_AMOUNT;
-        if (tier == Tier.SPRINT)   return SPRINT_AMOUNT;
-        if (tier == Tier.CHAMPION) return CHAMPION_AMOUNT;
-        return 0; // CUSTOM
+    function setAcceptedToken(address token, bool accepted) external onlyOwner {
+        require(token != address(0), "TippingSystem: zero address");
+        acceptedTokens[token] = accepted;
+        emit AcceptedTokenSet(token, accepted);
     }
 
-    /// @notice Returns the human-readable description for a given tier.
-    function getTierDescription(Tier tier) external pure returns (string memory) {
-        if (tier == Tier.COFFEE)   return COFFEE_DESC;
-        if (tier == Tier.SPRINT)   return SPRINT_DESC;
-        if (tier == Tier.CHAMPION) return CHAMPION_DESC;
-        return "Custom amount chosen by tipper";
+    function pause()   external onlyOwner { _pause(); }
+    function unpause() external onlyOwner { _unpause(); }
+
+    // -------------------------------------------------------------------------
+    // View helpers
+    // -------------------------------------------------------------------------
+
+    function getTipCount() external view returns (uint256) { return tipLog.length; }
+
+    function getTier(uint8 tier) external view returns (TierInfo memory) {
+        return tiers[tier];
     }
 
-    /// @notice Returns the full tip history array.
-    function getTipHistory() external view returns (Tip[] memory) {
-        return _tips;
-    }
+    // -------------------------------------------------------------------------
+    // Reject accidental ETH sends
+    // -------------------------------------------------------------------------
 
-    /// @notice Returns the top `n` non-anonymous tippers by cumulative contribution.
-    /// @dev    Uses a partial selection sort; intended for off-chain/view calls only.
-    /// @param n  Maximum number of results to return.
-    /// @return tippers  Addresses of the top tippers (descending by amount).
-    /// @return amounts  Corresponding cumulative amounts in wei.
-    function getTopTippers(uint256 n)
-        external
-        view
-        returns (address[] memory tippers, uint256[] memory amounts)
-    {
-        uint256 total = _uniqueTippers.length;
-        uint256 resultLen = n < total ? n : total;
-
-        // Build working copies to avoid mutating storage reads
-        address[] memory addrs  = new address[](total);
-        uint256[] memory amts   = new uint256[](total);
-        for (uint256 i = 0; i < total; i++) {
-            addrs[i] = _uniqueTippers[i];
-            amts[i]  = totalTippedBy[_uniqueTippers[i]];
-        }
-
-        // Partial selection sort – O(resultLen * total)
-        for (uint256 i = 0; i < resultLen; i++) {
-            uint256 maxIdx = i;
-            for (uint256 j = i + 1; j < total; j++) {
-                if (amts[j] > amts[maxIdx]) maxIdx = j;
-            }
-            if (maxIdx != i) {
-                (addrs[i], addrs[maxIdx]) = (addrs[maxIdx], addrs[i]);
-                (amts[i],  amts[maxIdx])  = (amts[maxIdx],  amts[i]);
-            }
-        }
-
-        tippers = new address[](resultLen);
-        amounts = new uint256[](resultLen);
-        for (uint256 i = 0; i < resultLen; i++) {
-            tippers[i] = addrs[i];
-            amounts[i] = amts[i];
-        }
-    }
+    receive() external payable { revert("TippingSystem: use tipETH()"); }
 }
